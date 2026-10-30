@@ -15,6 +15,10 @@ pub struct Cli {
     #[arg(long = "continue", global = true)]
     pub continue_session: bool,
 
+    /// Refuse every write instead of running with full access
+    #[arg(long = "read-only", global = true)]
+    pub read_only: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -59,6 +63,23 @@ mod tests {
         };
         assert!(args.yolo);
         assert_eq!(args.prompt(), "create a.txt");
+    }
+
+    #[test]
+    fn read_only_is_global_so_it_works_around_any_subcommand() {
+        for argv in [
+            vec!["rsh", "--read-only", "exec", "task"],
+            vec!["rsh", "exec", "--read-only", "task"],
+            vec!["rsh", "--read-only"],
+        ] {
+            let cli = Cli::try_parse_from(argv.clone()).unwrap();
+            assert!(cli.read_only, "read-only not parsed from {argv:?}");
+        }
+        assert!(
+            !Cli::try_parse_from(["rsh", "exec", "task"])
+                .unwrap()
+                .read_only
+        );
     }
 
     #[test]

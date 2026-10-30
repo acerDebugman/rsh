@@ -5,6 +5,8 @@
 > 适用对象：接手 rsh 开发的 agent / skill / 人
 > 关联文档：[Codex / CodeWhale 终端输入调研](terminal-input-research.md)
 
+> **实现状态（2026-10-31）**：M1–M5 已完成；`cargo test` 与两个 live e2e（Python 项目、grill-me）通过。实现期偏差：`workspace-write` 改为 `read-only`；inline viewport 拿不到 CPR 时降级为全屏；composer 暂只支持末尾编辑；新增 `src/prompt.rs`（统一系统提示词）与 `Approver`/`SessionApprovals` 审批层。
+
 ---
 
 ## 0. 一页摘要
@@ -494,13 +496,13 @@ dst run --cwd <cwd> --provider deepseek-official --model deepseek-flash \
 
 ```toml
 [permissions]
-mode = "danger-full-access"   # ask | workspace-write | danger-full-access
+mode = "danger-full-access"   # ask | read-only | danger-full-access
 ```
 
 | 模式 | 文件 | bash | 子代理 |
 |---|---|---|---|
 | `ask` | workspace 内自动，越界询问 | 逐条询问 | 继承 |
-| `workspace-write` | workspace 内自动，越界拒绝 | 自动（workspace 内） | 继承 |
+| `read-only` | 只读，写操作拒绝 | 变更型命令拒绝 | 继承 |
 | `danger-full-access` | 全开 | 全开 | 全开（默认） |
 
 - `--yolo` = `danger-full-access`。

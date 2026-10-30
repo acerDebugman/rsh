@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod llm;
+pub mod prompt;
 pub mod session;
 pub mod skills;
 pub mod subagent;

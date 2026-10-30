@@ -177,7 +177,7 @@ pub async fn run(
         ("DEEPSEEK_API_KEY".to_string(), api_key),
         (
             "DSH_PERMISSION_MODE".to_string(),
-            "danger-full-access".to_string(),
+            config.permissions.mode.as_str().to_string(),
         ),
     ];
     for key in ["DSH_HOME", "TMPDIR"] {

@@ -11,18 +11,24 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Agent, AgentEvent, TurnOutcome};
-use crate::config::Config;
+use crate::agent::{Agent, AgentEvent, CompactOutcome, TurnOutcome};
+use crate::config::{Config, PermissionMode};
 use crate::error::ToolError;
 use crate::llm::{LlmClient, OpenAiClient};
 use crate::session::{SessionStore, default_root, replay};
 use crate::skills::SkillRegistry;
 use crate::subagent::Manager;
-use crate::tools::{BashTool, Tool, ToolCtx, ToolOutput, ToolRegistry, UserIo};
+use crate::tools::{
+    Approval, ApprovalRequest, Approver, AskOutcome, BashTool, SessionApprovals, Tool, ToolCtx,
+    ToolOutput, ToolRegistry, UserIo,
+};
 
 pub(crate) struct UiState {
     pub(crate) input: String,
     pub(crate) busy: bool,
+    /// One turn waiting for the current one to finish. A second `Enter` while
+    /// busy replaces it instead of silently dropping the text.
+    pub(crate) queued: Option<String>,
     pub(crate) pending: Vec<String>,
     pub(crate) lines: Vec<String>,
     pub(crate) stream_buf: String,
@@ -30,12 +36,21 @@ pub(crate) struct UiState {
     pub(crate) model: String,
     pub(crate) cwd: String,
     pub(crate) question: Option<PendingQuestion>,
+    pub(crate) approval: Option<PendingApproval>,
+    pub(crate) permission: PermissionMode,
     skills: Arc<SkillRegistry>,
     current_cancel: Option<CancellationToken>,
+    approvals: Arc<SessionApprovals>,
+    approver: Option<Arc<dyn Approver>>,
 }
 
 pub(crate) struct PendingQuestion {
-    reply: oneshot::Sender<String>,
+    reply: oneshot::Sender<AskOutcome>,
+}
+
+pub(crate) struct PendingApproval {
+    request: ApprovalRequest,
+    reply: oneshot::Sender<Approval>,
 }
 
 impl UiState {
@@ -43,6 +58,7 @@ impl UiState {
         Self {
             input: String::new(),
             busy: false,
+            queued: None,
             pending: Vec::new(),
             lines: Vec::new(),
             stream_buf: String::new(),
@@ -50,9 +66,27 @@ impl UiState {
             model,
             cwd,
             question: None,
+            approval: None,
+            permission: PermissionMode::DangerFullAccess,
             skills,
             current_cancel: None,
+            approvals: Arc::new(SessionApprovals::default()),
+            approver: None,
         }
+    }
+
+    /// Wire the same permission mode, approval cache, and approval surface the
+    /// agent uses, so `!cmd` cannot bypass `ask` mode.
+    fn with_access(
+        mut self,
+        permission: PermissionMode,
+        approvals: Arc<SessionApprovals>,
+        approver: Arc<dyn Approver>,
+    ) -> Self {
+        self.permission = permission;
+        self.approvals = approvals;
+        self.approver = Some(approver);
+        self
     }
 
     fn push_line(&mut self, line: impl Into<String>) {
@@ -68,7 +102,7 @@ enum Command {
     },
     Compact {
         instruction: Option<String>,
-        reply: oneshot::Sender<Result<String>>,
+        reply: oneshot::Sender<Result<CompactOutcome>>,
     },
 }
 
@@ -76,11 +110,15 @@ enum UiMsg {
     Agent(AgentEvent),
     TurnDone(Result<TurnOutcome, String>),
     ShellDone(Result<ToolOutput, String>),
-    CompactDone(Result<String, String>),
+    CompactDone(Result<CompactOutcome, String>),
     Question {
         question: String,
         options: Vec<String>,
-        reply: oneshot::Sender<String>,
+        reply: oneshot::Sender<AskOutcome>,
+    },
+    Approval {
+        request: ApprovalRequest,
+        reply: oneshot::Sender<Approval>,
     },
 }
 
@@ -90,7 +128,7 @@ struct TuiUserIo {
 
 #[async_trait]
 impl UserIo for TuiUserIo {
-    async fn ask(&self, question: &str, options: &[String]) -> Result<String, ToolError> {
+    async fn ask(&self, question: &str, options: &[String]) -> Result<AskOutcome, ToolError> {
         let (reply, response) = oneshot::channel();
         self.ui_tx
             .send(UiMsg::Question {
@@ -101,7 +139,27 @@ impl UserIo for TuiUserIo {
             .map_err(|_| ToolError::Other("UI is closed".into()))?;
         response
             .await
-            .map_err(|_| ToolError::Other("question was cancelled".into()))
+            .map_err(|_| ToolError::Other("UI is closed".into()))
+    }
+}
+
+struct TuiApprover {
+    ui_tx: mpsc::UnboundedSender<UiMsg>,
+}
+
+#[async_trait]
+impl Approver for TuiApprover {
+    async fn approve(&self, request: &ApprovalRequest) -> Result<Approval, ToolError> {
+        let (reply, response) = oneshot::channel();
+        self.ui_tx
+            .send(UiMsg::Approval {
+                request: request.clone(),
+                reply,
+            })
+            .map_err(|_| ToolError::Other("UI is closed".into()))?;
+        response
+            .await
+            .map_err(|_| ToolError::Other("approval was cancelled".into()))
     }
 }
 
@@ -119,6 +177,10 @@ pub async fn run(config: Config, workspace: PathBuf, resume: Option<PathBuf>) ->
     let user_io = Arc::new(TuiUserIo {
         ui_tx: ui_tx.clone(),
     });
+    let approver: Arc<dyn Approver> = Arc::new(TuiApprover {
+        ui_tx: ui_tx.clone(),
+    });
+    let approvals = Arc::new(SessionApprovals::default());
 
     let mut agent = Agent::new(
         client,
@@ -128,7 +190,9 @@ pub async fn run(config: Config, workspace: PathBuf, resume: Option<PathBuf>) ->
     )
     .with_skills(Arc::clone(&skills))
     .with_user_io(user_io)
-    .with_subagents(manager);
+    .with_subagents(manager)
+    .with_approver(Some(Arc::clone(&approver)))
+    .with_approvals(Arc::clone(&approvals));
     let mut resumed_session = None;
     match resume {
         Some(path) => {
@@ -172,7 +236,12 @@ pub async fn run(config: Config, workspace: PathBuf, resume: Option<PathBuf>) ->
         config.model.clone(),
         workspace.display().to_string(),
         Arc::clone(&skills),
-    );
+    )
+    .with_access(config.permissions.mode, approvals, approver);
+    if config.permissions.mode == PermissionMode::Ask {
+        state
+            .push_line("permission mode: ask - every bash command and escaped path needs approval");
+    }
     if let Some(session) = resumed_session {
         state.push_line(format!("resumed session {session}"));
     }
@@ -203,7 +272,9 @@ pub async fn run(config: Config, workspace: PathBuf, resume: Option<PathBuf>) ->
             Some(event) = key_rx.recv() => {
                 handle_terminal_event(&mut state, event, &command_tx, &ui_tx, &workspace);
             }
-            Some(message) = ui_rx.recv() => handle_ui_message(&mut state, message),
+            Some(message) = ui_rx.recv() => {
+                handle_ui_message(&mut state, message, &command_tx, &ui_tx, &workspace)
+            }
             () = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
     }
@@ -273,6 +344,18 @@ fn handle_key(
     ui_tx: &mpsc::UnboundedSender<UiMsg>,
     workspace: &Path,
 ) {
+    if state.approval.is_some() {
+        match key.code {
+            KeyCode::Char('y') => resolve_approval(state, Approval::AllowOnce),
+            KeyCode::Char('a') => resolve_approval(state, Approval::AllowSession),
+            KeyCode::Char('n') | KeyCode::Esc => resolve_approval(state, Approval::Deny),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                resolve_approval(state, Approval::Deny);
+            }
+            _ => {}
+        }
+        return;
+    }
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if state.question.is_some() {
@@ -298,7 +381,9 @@ fn handle_key(
         KeyCode::Enter => {
             if state.question.is_some() {
                 answer_question(state);
-            } else if !state.busy {
+            } else if state.busy {
+                queue_input(state);
+            } else {
                 submit(state, command_tx, ui_tx, workspace);
             }
         }
@@ -332,6 +417,17 @@ fn submit(
     workspace: &Path,
 ) {
     let input = std::mem::take(&mut state.input);
+    dispatch_input(state, input, command_tx, ui_tx, workspace);
+}
+
+/// Route one composer payload: slash command, `!shell`, or a model turn.
+fn dispatch_input(
+    state: &mut UiState,
+    input: String,
+    command_tx: &mpsc::UnboundedSender<Command>,
+    ui_tx: &mpsc::UnboundedSender<UiMsg>,
+    workspace: &Path,
+) {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return;
@@ -434,14 +530,55 @@ fn answer_question(state: &mut UiState) {
     let answer = std::mem::take(&mut state.input);
     if let Some(question) = state.question.take() {
         state.push_line(format!("↳ {answer}"));
-        let _ = question.reply.send(answer);
+        let _ = question.reply.send(AskOutcome::Answered(answer));
     }
 }
 
 fn cancel_question(state: &mut UiState) {
     if let Some(question) = state.question.take() {
-        let _ = question.reply.send(String::new());
+        // Never an empty answer: cancellation is its own outcome.
+        let _ = question.reply.send(AskOutcome::Cancelled);
     }
+}
+
+fn resolve_approval(state: &mut UiState, decision: Approval) {
+    if let Some(approval) = state.approval.take() {
+        let label = match decision {
+            Approval::AllowOnce => "allowed once",
+            Approval::AllowSession => "allowed for this session",
+            Approval::Deny => "denied",
+        };
+        state.push_line(format!("  {label}: {}", approval.request.detail));
+        let _ = approval.reply.send(decision);
+    }
+}
+
+fn start_queued(
+    state: &mut UiState,
+    command_tx: &mpsc::UnboundedSender<Command>,
+    ui_tx: &mpsc::UnboundedSender<UiMsg>,
+    workspace: &Path,
+) {
+    let Some(input) = state.queued.take() else {
+        return;
+    };
+    dispatch_input(state, input, command_tx, ui_tx, workspace);
+}
+
+/// Busy + Enter: keep one turn on deck instead of dropping the text.
+fn queue_input(state: &mut UiState) {
+    let input = std::mem::take(&mut state.input);
+    let preview = truncate(input.trim(), 80);
+    if preview.is_empty() {
+        return;
+    }
+    let replaced = state.queued.is_some();
+    state.queued = Some(input);
+    state.push_line(if replaced {
+        format!("queued (replaced): {preview}")
+    } else {
+        format!("queued: {preview}")
+    });
 }
 
 fn handle_slash(state: &mut UiState, command: &str) {
@@ -482,8 +619,13 @@ fn run_shell(
     let ui = ui_tx.clone();
     let workspace = workspace.to_path_buf();
     let command = command.to_string();
+    // `!cmd` is a bash call like any other: it goes through the same mode,
+    // approval cache, and approval surface as the model's bash tool.
+    let context = ToolCtx::new(workspace)
+        .with_permission(state.permission)
+        .with_approvals(Arc::clone(&state.approvals))
+        .with_approver(state.approver.clone());
     tokio::spawn(async move {
-        let context = ToolCtx::new(workspace);
         let result = BashTool
             .run(serde_json::json!({"command": command}), &context)
             .await
@@ -498,7 +640,13 @@ fn cancel_turn(state: &mut UiState) {
     }
 }
 
-fn handle_ui_message(state: &mut UiState, message: UiMsg) {
+fn handle_ui_message(
+    state: &mut UiState,
+    message: UiMsg,
+    command_tx: &mpsc::UnboundedSender<Command>,
+    ui_tx: &mpsc::UnboundedSender<UiMsg>,
+    workspace: &Path,
+) {
     match message {
         UiMsg::Agent(AgentEvent::Text(text)) => {
             state.stream_buf.push_str(&text);
@@ -511,6 +659,16 @@ fn handle_ui_message(state: &mut UiState, message: UiMsg) {
         }
         UiMsg::Agent(AgentEvent::ToolEnd { name, ok, .. }) => {
             state.push_line(format!("{} {name}", if ok { "✓" } else { "✗" }));
+        }
+        UiMsg::Approval { request, reply } => {
+            flush_stream(state);
+            state.push_line(format!(
+                "⚠ approve {}: {}",
+                request.tool,
+                truncate(&request.detail, 160)
+            ));
+            state.push_line("  y allow · a allow for session · n deny");
+            state.approval = Some(PendingApproval { request, reply });
         }
         UiMsg::Question {
             question,
@@ -531,11 +689,15 @@ fn handle_ui_message(state: &mut UiState, message: UiMsg) {
             if let Err(error) = result {
                 state.push_line(format!("! {error}"));
             }
+            start_queued(state, command_tx, ui_tx, workspace);
         }
         UiMsg::CompactDone(result) => {
             state.busy = false;
             match result {
-                Ok(summary) => state.push_line(format!("✓ compacted: {summary}")),
+                Ok(outcome) => state.push_line(format!(
+                    "✓ compacted: {} · {} tokens",
+                    outcome.summary, outcome.usage.total_tokens
+                )),
                 Err(error) => state.push_line(format!("! compact failed: {error}")),
             }
         }
@@ -549,6 +711,7 @@ fn handle_ui_message(state: &mut UiState, message: UiMsg) {
                 }
                 Err(error) => state.push_line(format!("! {error}")),
             }
+            start_queued(state, command_tx, ui_tx, workspace);
         }
     }
 }
@@ -582,6 +745,196 @@ fn truncate(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DenyApprover;
+
+    #[async_trait]
+    impl Approver for DenyApprover {
+        async fn approve(&self, _request: &ApprovalRequest) -> Result<Approval, ToolError> {
+            Ok(Approval::Deny)
+        }
+    }
+
+    fn test_state() -> UiState {
+        UiState::new("m".into(), "cwd".into(), Arc::new(SkillRegistry::default()))
+    }
+
+    fn scratch() -> PathBuf {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::Builder::new()
+            .prefix("tui-")
+            .tempdir_in(&base)
+            .unwrap()
+            .keep()
+    }
+
+    #[tokio::test]
+    async fn shell_shortcut_cannot_bypass_ask_mode() {
+        let workspace = scratch();
+        let mut state = test_state().with_access(
+            PermissionMode::Ask,
+            Arc::new(SessionApprovals::default()),
+            Arc::new(DenyApprover),
+        );
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        run_shell(&mut state, &ui_tx, &workspace, "touch bypass.txt");
+        assert!(state.busy);
+
+        // A denial is a tool error result, not a crash: the transcript should
+        // say why and the command must not have run.
+        match ui_rx.recv().await.expect("shell result") {
+            UiMsg::ShellDone(Ok(output)) => {
+                assert!(output.is_error, "{}", output.content);
+                assert!(output.content.contains("denied"), "{}", output.content);
+            }
+            UiMsg::ShellDone(Err(error)) => panic!("unexpected transport error: {error}"),
+            _ => panic!("unexpected message"),
+        }
+        assert!(!workspace.join("bypass.txt").exists());
+        assert!(!state.approvals.is_allowed("bash", "touch bypass.txt"));
+    }
+
+    #[tokio::test]
+    async fn the_tui_approver_asks_and_forwards_the_decision() {
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let approver = TuiApprover {
+            ui_tx: ui_tx.clone(),
+        };
+        let request = ApprovalRequest {
+            tool: "bash",
+            detail: "rm -rf build".into(),
+        };
+        let asking = tokio::spawn(async move { approver.approve(&request).await });
+
+        match ui_rx.recv().await.expect("approval request") {
+            UiMsg::Approval { request, reply } => {
+                assert_eq!(request.tool, "bash");
+                assert_eq!(request.detail, "rm -rf build");
+                let _ = reply.send(Approval::AllowSession);
+            }
+            _ => panic!("expected an approval request"),
+        }
+        assert_eq!(asking.await.unwrap().unwrap(), Approval::AllowSession);
+    }
+
+    #[tokio::test]
+    async fn shell_shortcut_runs_when_full_access() {
+        let workspace = scratch();
+        let mut state = test_state();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        run_shell(&mut state, &ui_tx, &workspace, "printf ok");
+        match ui_rx.recv().await.expect("shell result") {
+            UiMsg::ShellDone(Ok(output)) => assert!(output.content.contains("ok")),
+            UiMsg::ShellDone(Err(error)) => panic!("unexpected error: {error}"),
+            _ => panic!("expected a shell result with no approval step"),
+        }
+    }
+
+    #[test]
+    fn busy_enter_keeps_exactly_one_queued_turn() {
+        let mut state = test_state();
+        state.busy = true;
+        state.input = "first".into();
+        queue_input(&mut state);
+        assert_eq!(state.queued.as_deref(), Some("first"));
+        assert!(state.input.is_empty());
+
+        state.input = "second".into();
+        queue_input(&mut state);
+        assert_eq!(state.queued.as_deref(), Some("second"));
+        assert!(
+            state
+                .pending
+                .iter()
+                .any(|line| line.contains("queued (replaced): second"))
+        );
+    }
+
+    #[test]
+    fn empty_input_does_not_queue() {
+        let mut state = test_state();
+        state.busy = true;
+        state.input = "   ".into();
+        queue_input(&mut state);
+        assert!(state.queued.is_none());
+    }
+
+    #[test]
+    fn cancelling_a_question_reports_cancelled_not_an_empty_answer() {
+        let mut state = test_state();
+        let (reply, mut answer) = oneshot::channel();
+        state.question = Some(PendingQuestion { reply });
+        cancel_question(&mut state);
+        assert_eq!(answer.try_recv().unwrap(), AskOutcome::Cancelled);
+        assert!(state.question.is_none());
+    }
+
+    #[test]
+    fn answering_a_question_reports_the_text() {
+        let mut state = test_state();
+        let (reply, mut answer) = oneshot::channel();
+        state.question = Some(PendingQuestion { reply });
+        state.input = "yes, do it".into();
+        answer_question(&mut state);
+        assert_eq!(
+            answer.try_recv().unwrap(),
+            AskOutcome::Answered("yes, do it".into())
+        );
+    }
+
+    #[test]
+    fn approval_keys_map_to_decisions() {
+        for (key, expected) in [
+            ('y', Approval::AllowOnce),
+            ('a', Approval::AllowSession),
+            ('n', Approval::Deny),
+        ] {
+            let mut state = test_state();
+            let (reply, mut decision) = oneshot::channel();
+            state.approval = Some(PendingApproval {
+                request: ApprovalRequest {
+                    tool: "bash",
+                    detail: "ls".into(),
+                },
+                reply,
+            });
+            let (command_tx, _command_rx) = mpsc::unbounded_channel();
+            let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                &command_tx,
+                &ui_tx,
+                Path::new("."),
+            );
+            assert_eq!(decision.try_recv().unwrap(), expected);
+            assert!(state.approval.is_none());
+        }
+    }
+
+    #[test]
+    fn approval_keys_do_not_leak_into_the_composer() {
+        let mut state = test_state();
+        let (reply, _decision) = oneshot::channel();
+        state.approval = Some(PendingApproval {
+            request: ApprovalRequest {
+                tool: "bash",
+                detail: "ls".into(),
+            },
+            reply,
+        });
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            &command_tx,
+            &ui_tx,
+            Path::new("."),
+        );
+        assert!(state.input.is_empty());
+    }
 
     #[test]
     fn truncate_keeps_short_text() {

@@ -39,6 +39,11 @@ pub enum EventKind {
     ToolResult {
         call_id: String,
         name: String,
+        /// The raw JSON arguments the model sent. Recorded next to the result
+        /// so one line tells you what ran, with what, and how it went — the
+        /// audit trail full-access mode relies on.
+        #[serde(default)]
+        args: String,
         ok: bool,
         content: String,
     },
@@ -309,6 +314,7 @@ mod tests {
             SessionEvent::new(EventKind::ToolResult {
                 call_id: "call_1".into(),
                 name: "bash".into(),
+                args: "{\"command\":\"ls\"}".into(),
                 ok: true,
                 content: "a.txt\n[exit code: 0]".into(),
             }),

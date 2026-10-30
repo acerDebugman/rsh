@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 
 use crate::error::{ToolError, ToolResult};
 
-use super::{Tool, ToolCtx, ToolOutput, function_schema, resolve_path};
+use super::{Tool, ToolCtx, ToolOutput, function_schema, resolve_path_checked};
 
 pub struct ReadFileTool;
 
@@ -50,7 +50,7 @@ impl Tool for ReadFileTool {
             .unwrap_or(2_000)
             .clamp(1, 10_000) as usize;
 
-        let path = resolve_path(ctx, raw)?;
+        let path = resolve_path_checked(ctx, raw).await?;
         let bytes = tokio::fs::read(&path).await.map_err(ToolError::Io)?;
         if bytes.iter().take(8_192).any(|byte| *byte == 0) {
             return Ok(ToolOutput::error(format!(
@@ -115,7 +115,8 @@ impl Tool for WriteFileTool {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidArgs("content is required".into()))?;
 
-        let path = resolve_path(ctx, raw)?;
+        ctx.ensure_writable("write_file", raw)?;
+        let path = resolve_path_checked(ctx, raw).await?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -186,7 +187,8 @@ impl Tool for EditFileTool {
             ));
         }
 
-        let path = resolve_path(ctx, raw)?;
+        ctx.ensure_writable("edit_file", raw)?;
+        let path = resolve_path_checked(ctx, raw).await?;
         let text = tokio::fs::read_to_string(&path)
             .await
             .map_err(ToolError::Io)?;

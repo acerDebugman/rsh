@@ -1,23 +1,20 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::llm::{ChatRequest, LlmClient, LlmEvent, Message, Role};
+use crate::llm::{ChatRequest, LlmClient, LlmEvent, Message, Role, Usage};
+use crate::prompt::{PromptContext, system_prompt};
 use crate::session::{EventKind, SessionStore};
 use crate::skills::SkillRegistry;
 use crate::subagent::SubagentRunner;
-use crate::tools::{ToolCtx, ToolOutput, ToolRegistry, UserIo};
+use crate::tools::{Approver, SessionApprovals, ToolCtx, ToolOutput, ToolRegistry, UserIo};
 
-const SYSTEM_PROMPT: &str = "\
-You are rsh, a terminal coding agent working inside the user's workspace.\n\
-Use the provided tools to inspect and modify files. Prefer reading before editing.\n\
-Check the [exit code: N] marker on every bash result and investigate failures.\n\
-Keep replies short and concrete. Do not invent file contents.";
+use super::transcript::render_transcript;
 
 /// Progress emitted while a turn runs, consumed by the CLI/TUI.
 #[derive(Debug, Clone)]
@@ -36,10 +33,20 @@ pub enum AgentEvent {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct CompactOutcome {
+    pub summary: String,
+    /// Compaction spend is billed to the session even though it is not part of
+    /// the turn budget.
+    pub usage: Usage,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct TurnOutcome {
     pub text: String,
     pub steps: usize,
     pub changed_files: Vec<PathBuf>,
+    /// Only the API-reported usage counts. Local guesses are not spend.
+    pub usage: Usage,
 }
 
 pub struct Agent {
@@ -52,6 +59,8 @@ pub struct Agent {
     skills: Option<Arc<SkillRegistry>>,
     user_io: Option<Arc<dyn UserIo>>,
     subagents: Option<Arc<dyn SubagentRunner>>,
+    approver: Option<Arc<dyn Approver>>,
+    approvals: Arc<SessionApprovals>,
 }
 
 impl Agent {
@@ -72,6 +81,8 @@ impl Agent {
             skills: None,
             user_io: None,
             subagents: None,
+            approver: None,
+            approvals: Arc::new(SessionApprovals::default()),
         }
     }
 
@@ -100,6 +111,20 @@ impl Agent {
     }
 
     #[must_use]
+    pub fn with_approver(mut self, approver: Option<Arc<dyn Approver>>) -> Self {
+        self.approver = approver;
+        self
+    }
+
+    /// One approval cache per process: "allow for this session" has to outlive
+    /// a single tool call.
+    #[must_use]
+    pub fn with_approvals(mut self, approvals: Arc<SessionApprovals>) -> Self {
+        self.approvals = approvals;
+        self
+    }
+
+    #[must_use]
     pub fn with_messages(mut self, messages: Vec<Message>) -> Self {
         self.messages = messages;
         self
@@ -107,7 +132,7 @@ impl Agent {
 
     /// Replace older messages with a model-written summary, keeping the last
     /// two user turns. The system prompt is preserved.
-    pub async fn compact(&mut self, instruction: Option<&str>) -> Result<String> {
+    pub async fn compact(&mut self, instruction: Option<&str>) -> Result<CompactOutcome> {
         if self.messages.len() < 4 {
             bail!("nothing to compact yet");
         }
@@ -145,12 +170,20 @@ impl Agent {
             send_reasoning: false,
         };
         let (tx, mut rx) = mpsc::channel(64);
-        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let drain = tokio::spawn(async move {
+            let mut usage = Usage::default();
+            while let Some(event) = rx.recv().await {
+                if let LlmEvent::Usage(reported) = event {
+                    usage = reported;
+                }
+            }
+            usage
+        });
         let outcome = self
             .llm
             .stream_chat(request, tx, CancellationToken::new())
             .await;
-        let _ = drain.await;
+        let usage = drain.await.unwrap_or_default();
         let outcome = outcome?;
         let summary = outcome.text.trim().to_string();
         if summary.is_empty() {
@@ -160,13 +193,13 @@ impl Agent {
         self.record(EventKind::Compaction {
             summary: summary.clone(),
             replaces_until: cut - 1,
-        });
+        })?;
         let tail = self.messages.split_off(cut);
         self.messages.truncate(1);
         self.messages
             .push(Message::system(format!("[compaction summary]\n{summary}")));
         self.messages.extend(tail);
-        Ok(summary)
+        Ok(CompactOutcome { summary, usage })
     }
 
     #[must_use]
@@ -189,8 +222,9 @@ impl Agent {
         self.messages.push(Message::user(input));
         self.record(EventKind::UserMessage {
             text: input.to_string(),
-        });
+        })?;
 
+        let mut usage = Usage::default();
         let mut final_text = String::new();
         let mut changed_files: Vec<PathBuf> = Vec::new();
         for step in 0..self.config.max_steps {
@@ -205,7 +239,10 @@ impl Agent {
             let (tx, rx) = mpsc::channel(256);
             let forwarder = spawn_forwarder(rx, events.clone());
             let result = self.llm.stream_chat(request, tx, cancel.clone()).await;
-            let _ = forwarder.await;
+            let step_usage = forwarder.await.unwrap_or_default();
+            usage.prompt_tokens += step_usage.prompt_tokens;
+            usage.completion_tokens += step_usage.completion_tokens;
+            usage.total_tokens += step_usage.total_tokens;
             let outcome = result?;
 
             if !outcome.text.is_empty() {
@@ -225,16 +262,17 @@ impl Agent {
                 text: outcome.text,
                 reasoning,
                 tool_calls: outcome.tool_calls.clone(),
-            });
+            })?;
 
             if outcome.tool_calls.is_empty() {
                 self.record(EventKind::TurnEnd {
                     reason: "completed".into(),
-                });
+                })?;
                 return Ok(TurnOutcome {
                     text: final_text,
                     steps: step + 1,
                     changed_files,
+                    usage,
                 });
             }
 
@@ -274,16 +312,17 @@ impl Agent {
                 self.record(EventKind::ToolResult {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
+                    args: raw.to_string(),
                     ok: !output.is_error,
                     content: output.content.clone(),
-                });
+                })?;
                 self.messages.push(Message::tool(call.id, output.content));
             }
         }
 
         self.record(EventKind::TurnEnd {
             reason: "max_steps".into(),
-        });
+        })?;
         bail!("max steps ({}) exceeded", self.config.max_steps)
     }
 
@@ -296,89 +335,51 @@ impl Agent {
             user_io: self.user_io.clone(),
             skills: self.skills.clone(),
             subagents: self.subagents.clone(),
+            approver: self.approver.clone(),
+            approvals: Arc::clone(&self.approvals),
         }
     }
 
     fn system_prompt(&self) -> String {
-        let mut prompt = SYSTEM_PROMPT.to_string();
-        let Some(skills) = &self.skills else {
-            return prompt;
-        };
-        let visible: Vec<_> = skills
-            .list()
-            .into_iter()
-            .filter(|skill| !skill.disable_model_invocation)
-            .collect();
-        if visible.is_empty() {
-            return prompt;
-        }
-        prompt.push_str("\n\nAvailable skills (load with the skill tool):\n");
-        for skill in visible {
-            if skill.description.is_empty() {
-                prompt.push_str(&format!("- {}\n", skill.name));
-            } else {
-                prompt.push_str(&format!("- {}: {}\n", skill.name, skill.description));
-            }
-        }
-        prompt
+        let context =
+            PromptContext::new(&self.workspace, &self.config).with_skills(self.skills.as_deref());
+        system_prompt(&context)
     }
 
-    fn record(&mut self, kind: EventKind) {
+    /// A failed append is a failed turn. Best-effort logging would mean the log
+    /// silently disagrees with what the model actually saw.
+    fn record(&mut self, kind: EventKind) -> Result<()> {
         let Some(session) = &mut self.session else {
-            return;
+            return Ok(());
         };
-        if let Err(error) = session.append(kind) {
-            eprintln!("warning: failed to append session event: {error}");
-        }
+        session.append(kind).context("append session event")?;
+        Ok(())
+    }
+
+    /// Tools currently exposed to the model. Used by the TUI status line.
+    #[must_use]
+    pub fn tool_names(&self) -> Vec<&'static str> {
+        self.tools.names()
     }
 }
 
-fn render_transcript(messages: &[Message]) -> String {
-    let mut output = String::new();
-    for message in messages {
-        let role = match message.role {
-            Role::System => "System",
-            Role::User => "User",
-            Role::Assistant => "Assistant",
-            Role::Tool => "Tool",
-        };
-        output.push_str(role);
-        output.push_str(": ");
-        if !message.content.is_empty() {
-            output.push_str(&truncate_chars(&message.content, 2_000));
-        }
-        if !message.tool_calls.is_empty() {
-            let names: Vec<&str> = message
-                .tool_calls
-                .iter()
-                .map(|call| call.name.as_str())
-                .collect();
-            output.push_str(&format!(" [calls: {}]", names.join(", ")));
-        }
-        output.push('\n');
-    }
-    truncate_chars(&output, 60_000)
-}
-
-fn truncate_chars(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_string();
-    }
-    let mut shortened: String = text.chars().take(limit).collect();
-    shortened.push('…');
-    shortened
-}
-
+/// Forward UI events and hand back the API-reported usage. Dropping `Usage`
+/// would leave the caller with no way to count spend.
 fn spawn_forwarder(
     mut rx: mpsc::Receiver<LlmEvent>,
     events: mpsc::Sender<AgentEvent>,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<Usage> {
     tokio::spawn(async move {
+        let mut usage = Usage::default();
         while let Some(event) = rx.recv().await {
             let mapped = match event {
                 LlmEvent::Text(text) => Some(AgentEvent::Text(text)),
                 LlmEvent::Reasoning(text) => Some(AgentEvent::Reasoning(text)),
-                LlmEvent::ToolCall { .. } | LlmEvent::Usage(_) => None,
+                LlmEvent::ToolCall { .. } => None,
+                LlmEvent::Usage(reported) => {
+                    usage = reported;
+                    None
+                }
             };
             if let Some(mapped) = mapped {
                 if events.send(mapped).await.is_err() {
@@ -386,6 +387,7 @@ fn spawn_forwarder(
                 }
             }
         }
+        usage
     })
 }
 
@@ -430,6 +432,14 @@ mod tests {
             if !outcome.text.is_empty() {
                 let _ = events.send(LlmEvent::Text(outcome.text.clone())).await;
             }
+            // Every response reports usage; the loop must not drop it.
+            let _ = events
+                .send(LlmEvent::Usage(Usage {
+                    prompt_tokens: 20,
+                    completion_tokens: 10,
+                    total_tokens: 30,
+                }))
+                .await;
             Ok(outcome)
         }
     }
@@ -508,6 +518,8 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.text, "hello");
         assert_eq!(outcome.steps, 1);
+        assert_eq!(outcome.usage.total_tokens, 30);
+        assert_eq!(outcome.usage.prompt_tokens, 20);
         let mut texts = Vec::new();
         while let Ok(event) = rx.try_recv() {
             if let AgentEvent::Text(text) = event {
@@ -527,6 +539,7 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.text, "done");
         assert_eq!(outcome.steps, 2);
+        assert_eq!(outcome.usage.total_tokens, 60, "usage accumulates per step");
         let tool_message = agent
             .messages()
             .iter()
@@ -584,8 +597,8 @@ mod tests {
             Message::user("u3"),
             Message::assistant("a3", None, Vec::new()),
         ]);
-        let summary = agent.compact(None).await.unwrap();
-        assert_eq!(summary, "SUMMARY");
+        let outcome = agent.compact(None).await.unwrap();
+        assert_eq!(outcome.summary, "SUMMARY");
         assert_eq!(agent.messages().len(), 6);
         assert_eq!(agent.messages()[0].content, "sys");
         assert!(agent.messages()[1].content.contains("SUMMARY"));

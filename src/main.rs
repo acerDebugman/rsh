@@ -30,15 +30,29 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
-        Some(Command::Exec(args)) => run_exec(args, workspace, resume).await,
+        Some(Command::Exec(args)) => run_exec(args, workspace, resume, cli.read_only).await,
         None => {
-            let config = Config::load(None)?;
+            let mut config = Config::load(None)?;
+            apply_read_only(&mut config, cli.read_only);
             rsh::tui::run(config, workspace, resume).await
         }
     }
 }
 
-async fn run_exec(args: ExecArgs, workspace: PathBuf, resume: Option<PathBuf>) -> Result<()> {
+fn apply_read_only(config: &mut Config, read_only: bool) {
+    // The flag wins over both `--yolo` and the config file: the escape hatch
+    // must never be the thing that gets silently overridden.
+    if read_only {
+        config.permissions.mode = PermissionMode::ReadOnly;
+    }
+}
+
+async fn run_exec(
+    args: ExecArgs,
+    workspace: PathBuf,
+    resume: Option<PathBuf>,
+    read_only: bool,
+) -> Result<()> {
     let mut config = Config::load(None)?;
     if let Some(model) = &args.model {
         config.model = model.clone();
@@ -46,7 +60,15 @@ async fn run_exec(args: ExecArgs, workspace: PathBuf, resume: Option<PathBuf>) -
     if args.yolo {
         config.permissions.mode = PermissionMode::DangerFullAccess;
     }
+    apply_read_only(&mut config, read_only);
     config.validate()?;
+    // `exec` is headless: an approval prompt has nowhere to land, so refusing
+    // up front keeps `--yolo` in --help from being a lie.
+    if config.permissions.mode == PermissionMode::Ask {
+        anyhow::bail!(
+            "`rsh exec` cannot run in ask mode (no approval surface); pass --yolo to run with full access"
+        );
+    }
 
     let client: Arc<dyn LlmClient> = Arc::new(OpenAiClient::from_config(&config)?);
     let skills = Arc::new(SkillRegistry::discover(&workspace));

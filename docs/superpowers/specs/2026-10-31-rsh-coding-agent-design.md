@@ -1,6 +1,6 @@
 # rsh Coding Agent — Design Spec
 
-- 状态：待评审（draft for review）
+- 状态：已实现并通过 live e2e（2026-10-31）
 - 日期：2026-10-31
 - 详细实现计划（实现细节以它为准）：[design/rsh-development-plan.md](../../../design/rsh-development-plan.md)
 - 领域术语：[CONTEXT.md](../../../CONTEXT.md)
@@ -119,7 +119,7 @@ rsh 要在**一个 Rust 二进制**里同时做到：
 ### 4.8 权限与安全（PERM）
 
 - **PERM-1** 默认 `danger-full-access`：主 agent 与子代理都不逐条确认（用户确认的产品决策）。
-- **PERM-2** 保留 `ask` 与 `workspace-write` 模式；`--yolo` 等价全开。
+- **PERM-2** 保留 `ask` 与 `read-only` 模式；`--yolo` 等价全开。
 - **PERM-3** `ask` 模式下 `bash` 在 composer 位置显示审批条：`y` 允许一次、`a` 本会话允许、`n` 拒绝。
 - **PERM-4** README 与启动 banner 必须提示默认全开的风险。
 

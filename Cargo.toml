@@ -28,5 +28,11 @@ crossterm = { version = "0.29", features = ["bracketed-paste"] }
 toml = "0.8"
 walkdir = "2"
 
+[target.'cfg(unix)'.dependencies]
+# Justified: `setsid` + `killpg` so a timed-out `sh -c` cannot leave rustc or
+# pytest grandchildren running as orphans.
+libc = "0.2"
+
 [dev-dependencies]
+portable-pty = "0.9"
 tempfile = "3"

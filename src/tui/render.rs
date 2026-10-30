@@ -80,10 +80,21 @@ fn draw_composer(frame: &mut Frame, state: &UiState, area: Rect) {
         area.y + input_height - 1,
     ));
 
-    let status = if state.question.is_some() {
+    let status = if let Some(approval) = &state.approval {
+        format!(
+            "⚠ {}: {} · y allow · a allow for session · n deny",
+            approval.request.tool,
+            truncate(&approval.request.detail, 60)
+        )
+    } else if state.question.is_some() {
         format!("{} · answer the question · Enter send", state.model)
     } else if state.busy {
-        format!("{} · working…  Esc cancel", state.model)
+        let queued = if state.queued.is_some() {
+            " · 1 queued"
+        } else {
+            ""
+        };
+        format!("{} · working…  Esc cancel{queued}", state.model)
     } else {
         format!(
             "{} · {} · Enter send · Ctrl+J newline · !shell · /help",
@@ -141,6 +152,15 @@ pub fn flush_pending(
         return Err(error.into());
     }
     Ok(())
+}
+
+fn truncate(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut shortened: String = text.chars().take(limit).collect();
+    shortened.push('…');
+    shortened
 }
 
 /// Hard-wrap by display width so CJK and emoji never exceed the terminal.

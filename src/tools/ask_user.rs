@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 
 use crate::error::ToolResult;
 
-use super::{Tool, ToolCtx, ToolOutput, function_schema};
+use super::{AskOutcome, Tool, ToolCtx, ToolOutput, function_schema};
 
 /// Ask the user a question. In a TUI session this blocks until the user
 /// answers in the composer; headless runs report that no UI is available.
@@ -57,7 +57,9 @@ impl Tool for AskUserTool {
             ));
         };
         match user_io.ask(question, &options).await {
-            Ok(answer) => Ok(ToolOutput::ok(answer)),
+            Ok(AskOutcome::Answered(answer)) => Ok(ToolOutput::ok(answer)),
+            // Never an empty string: the model would read that as an answer.
+            Ok(AskOutcome::Cancelled) => Ok(ToolOutput::error("user cancelled the question")),
             Err(error) => Ok(ToolOutput::error(error.to_string())),
         }
     }
@@ -71,25 +73,43 @@ mod tests {
 
     use super::*;
     use crate::error::ToolError;
-    use crate::tools::UserIo;
+    use crate::tools::{AskOutcome, UserIo};
 
-    struct MockUserIo;
+    struct MockUserIo {
+        outcome: AskOutcome,
+    }
 
     #[async_trait]
     impl UserIo for MockUserIo {
-        async fn ask(&self, _question: &str, _options: &[String]) -> Result<String, ToolError> {
-            Ok("yes".into())
+        async fn ask(&self, _question: &str, _options: &[String]) -> Result<AskOutcome, ToolError> {
+            Ok(self.outcome.clone())
         }
+    }
+
+    fn ctx_with(outcome: AskOutcome) -> ToolCtx {
+        ToolCtx::new(std::env::temp_dir()).with_user_io(Some(Arc::new(MockUserIo { outcome })))
     }
 
     #[tokio::test]
     async fn uses_the_interactive_bridge() {
-        let ctx = ToolCtx::new(std::env::temp_dir()).with_user_io(Some(Arc::new(MockUserIo)));
+        let ctx = ctx_with(AskOutcome::Answered("yes".into()));
         let output = AskUserTool
             .run(json!({"question": "continue?"}), &ctx)
             .await
             .unwrap();
         assert_eq!(output.content, "yes");
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_an_error_not_an_empty_answer() {
+        let ctx = ctx_with(AskOutcome::Cancelled);
+        let output = AskUserTool
+            .run(json!({"question": "continue?"}), &ctx)
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("cancelled"));
+        assert_ne!(output.content, "");
     }
 
     #[tokio::test]

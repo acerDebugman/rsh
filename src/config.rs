@@ -48,8 +48,12 @@ pub struct Permissions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionMode {
+    /// Prompt before every side-effecting action.
     Ask,
-    WorkspaceWrite,
+    /// Read-only escape hatch: reads run, any write is refused.
+    ReadOnly,
+    /// Default: no prompts, no allow/deny lists. The agent has exactly the
+    /// permissions of the process; every tool call is still audited.
     #[default]
     DangerFullAccess,
 }
@@ -59,7 +63,7 @@ impl PermissionMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "ask" => Some(Self::Ask),
-            "workspace-write" => Some(Self::WorkspaceWrite),
+            "read-only" | "readonly" => Some(Self::ReadOnly),
             "danger-full-access" => Some(Self::DangerFullAccess),
             _ => None,
         }
@@ -69,7 +73,7 @@ impl PermissionMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ask => "ask",
-            Self::WorkspaceWrite => "workspace-write",
+            Self::ReadOnly => "read-only",
             Self::DangerFullAccess => "danger-full-access",
         }
     }
@@ -209,6 +213,29 @@ mod tests {
     }
 
     #[test]
+    fn read_only_is_a_first_class_mode() {
+        assert_eq!(
+            PermissionMode::parse("read-only"),
+            Some(PermissionMode::ReadOnly)
+        );
+        assert_eq!(PermissionMode::ReadOnly.as_str(), "read-only");
+        assert_eq!(
+            PermissionMode::parse(PermissionMode::ReadOnly.as_str()),
+            Some(PermissionMode::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn read_only_arrives_through_the_environment() {
+        let mut config = Config::default();
+        config.apply_env(|key| match key {
+            "RSH_PERMISSION_MODE" => Some("read-only".to_string()),
+            _ => None,
+        });
+        assert_eq!(config.permissions.mode, PermissionMode::ReadOnly);
+    }
+
+    #[test]
     fn toml_overrides_defaults() {
         let dir = temp_dir();
         let path = dir.path().join("config.toml");
@@ -232,25 +259,23 @@ mod tests {
             "RSH_MODEL" => Some("custom-model".to_string()),
             "RSH_BASE_URL" => Some("http://localhost:1234".to_string()),
             "RSH_MAX_STEPS" => Some("9".to_string()),
-            "RSH_PERMISSION_MODE" => Some("workspace-write".to_string()),
+            "RSH_PERMISSION_MODE" => Some("ask".to_string()),
             _ => None,
         });
         assert_eq!(config.model, "custom-model");
         assert_eq!(config.base_url, "http://localhost:1234");
         assert_eq!(config.max_steps, 9);
-        assert_eq!(config.permissions.mode, PermissionMode::WorkspaceWrite);
+        assert_eq!(config.permissions.mode, PermissionMode::Ask);
     }
 
     #[test]
     fn permission_mode_round_trips() {
-        for mode in [
-            PermissionMode::Ask,
-            PermissionMode::WorkspaceWrite,
-            PermissionMode::DangerFullAccess,
-        ] {
+        for mode in [PermissionMode::Ask, PermissionMode::DangerFullAccess] {
             assert_eq!(PermissionMode::parse(mode.as_str()), Some(mode));
         }
         assert_eq!(PermissionMode::parse("nope"), None);
+        // A sandbox that `sh -c` can step around is worse than no sandbox.
+        assert_eq!(PermissionMode::parse("workspace-write"), None);
     }
 
     #[test]

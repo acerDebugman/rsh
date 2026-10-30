@@ -6,6 +6,8 @@ pub enum ToolError {
     InvalidArgs(String),
     #[error("path escapes workspace: {0}")]
     PathEscape(String),
+    #[error("{0}")]
+    Denied(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]
