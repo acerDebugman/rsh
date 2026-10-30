@@ -14,9 +14,10 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::{Agent, AgentEvent, TurnOutcome};
 use crate::config::Config;
 use crate::error::ToolError;
-use crate::llm::OpenAiClient;
-use crate::session::SessionStore;
+use crate::llm::{LlmClient, OpenAiClient};
+use crate::session::{SessionStore, default_root, replay};
 use crate::skills::SkillRegistry;
+use crate::subagent::Manager;
 use crate::tools::{BashTool, Tool, ToolCtx, ToolOutput, ToolRegistry, UserIo};
 
 pub(crate) struct UiState {
@@ -65,12 +66,17 @@ enum Command {
         cancel: CancellationToken,
         reply: oneshot::Sender<Result<TurnOutcome>>,
     },
+    Compact {
+        instruction: Option<String>,
+        reply: oneshot::Sender<Result<String>>,
+    },
 }
 
 enum UiMsg {
     Agent(AgentEvent),
     TurnDone(Result<TurnOutcome, String>),
     ShellDone(Result<ToolOutput, String>),
+    CompactDone(Result<String, String>),
     Question {
         question: String,
         options: Vec<String>,
@@ -99,26 +105,47 @@ impl UserIo for TuiUserIo {
     }
 }
 
-pub async fn run(config: Config, workspace: PathBuf) -> Result<()> {
-    let client = OpenAiClient::from_config(&config)?;
+pub async fn run(config: Config, workspace: PathBuf, resume: Option<PathBuf>) -> Result<()> {
+    let client: Arc<dyn LlmClient> = Arc::new(OpenAiClient::from_config(&config)?);
     let tools = Arc::new(ToolRegistry::with_builtin_tools());
     let skills = Arc::new(SkillRegistry::discover(&workspace));
+    let manager = Arc::new(Manager::new(
+        Arc::clone(&client),
+        config.clone(),
+        Arc::clone(&skills),
+        workspace.clone(),
+    ));
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
     let user_io = Arc::new(TuiUserIo {
         ui_tx: ui_tx.clone(),
     });
 
     let mut agent = Agent::new(
-        Arc::new(client),
+        client,
         Arc::clone(&tools),
         config.clone(),
         workspace.clone(),
     )
     .with_skills(Arc::clone(&skills))
-    .with_user_io(user_io);
-    match SessionStore::create(&session_root(), &workspace, &config.model) {
-        Ok(session) => agent = agent.with_session(session),
-        Err(error) => eprintln!("warning: session log disabled: {error}"),
+    .with_user_io(user_io)
+    .with_subagents(manager);
+    let mut resumed_session = None;
+    match resume {
+        Some(path) => {
+            let events = SessionStore::load(&path)?;
+            agent = agent.with_messages(replay(&events));
+            match SessionStore::open(&path) {
+                Ok(store) => {
+                    resumed_session = Some(store.session_id().to_string());
+                    agent = agent.with_session(store);
+                }
+                Err(error) => eprintln!("warning: session log disabled: {error}"),
+            }
+        }
+        None => match SessionStore::create(&default_root(), &workspace, &config.model) {
+            Ok(session) => agent = agent.with_session(session),
+            Err(error) => eprintln!("warning: session log disabled: {error}"),
+        },
     }
 
     let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -146,6 +173,9 @@ pub async fn run(config: Config, workspace: PathBuf) -> Result<()> {
         workspace.display().to_string(),
         Arc::clone(&skills),
     );
+    if let Some(session) = resumed_session {
+        state.push_line(format!("resumed session {session}"));
+    }
 
     loop {
         if let Err(error) = terminal.draw(|frame| render::draw(frame, &state, mode)) {
@@ -186,24 +216,31 @@ async fn agent_actor(
     mut commands: mpsc::UnboundedReceiver<Command>,
     ui_tx: mpsc::UnboundedSender<UiMsg>,
 ) {
-    while let Some(Command::Turn {
-        input,
-        cancel,
-        reply,
-    }) = commands.recv().await
-    {
-        let (event_tx, mut event_rx) = mpsc::channel(256);
-        let ui = ui_tx.clone();
-        let forwarder = tokio::spawn(async move {
-            while let Some(event) = event_rx.recv().await {
-                if ui.send(UiMsg::Agent(event)).is_err() {
-                    break;
-                }
+    while let Some(command) = commands.recv().await {
+        match command {
+            Command::Turn {
+                input,
+                cancel,
+                reply,
+            } => {
+                let (event_tx, mut event_rx) = mpsc::channel(256);
+                let ui = ui_tx.clone();
+                let forwarder = tokio::spawn(async move {
+                    while let Some(event) = event_rx.recv().await {
+                        if ui.send(UiMsg::Agent(event)).is_err() {
+                            break;
+                        }
+                    }
+                });
+                let result = agent.run_turn(&input, event_tx, cancel).await;
+                let _ = forwarder.await;
+                let _ = reply.send(result);
             }
-        });
-        let result = agent.run_turn(&input, event_tx, cancel).await;
-        let _ = forwarder.await;
-        let _ = reply.send(result);
+            Command::Compact { instruction, reply } => {
+                let result = agent.compact(instruction.as_deref()).await;
+                let _ = reply.send(result);
+            }
+        }
     }
 }
 
@@ -300,6 +337,16 @@ fn submit(
         return;
     }
     if let Some(command) = trimmed.strip_prefix('/') {
+        if command == "compact" || command.starts_with("compact ") {
+            let instruction = command.trim_start_matches("compact").trim();
+            let instruction = if instruction.is_empty() {
+                None
+            } else {
+                Some(instruction.to_string())
+            };
+            start_compact(state, instruction, command_tx, ui_tx);
+            return;
+        }
         if let Some(args) = command.strip_prefix("skill") {
             let args = args.trim_start();
             if args.is_empty() {
@@ -357,6 +404,29 @@ fn start_turn(
             Err(error) => Err(format!("agent task dropped: {error}")),
         };
         let _ = ui.send(UiMsg::TurnDone(result));
+    });
+}
+
+fn start_compact(
+    state: &mut UiState,
+    instruction: Option<String>,
+    command_tx: &mpsc::UnboundedSender<Command>,
+    ui_tx: &mpsc::UnboundedSender<UiMsg>,
+) {
+    state.push_line("… compacting");
+    state.busy = true;
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let _ = command_tx.send(Command::Compact {
+        instruction,
+        reply: reply_tx,
+    });
+    let ui = ui_tx.clone();
+    tokio::spawn(async move {
+        let result = match reply_rx.await {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(error) => Err(format!("agent task dropped: {error}")),
+        };
+        let _ = ui.send(UiMsg::CompactDone(result));
     });
 }
 
@@ -462,6 +532,13 @@ fn handle_ui_message(state: &mut UiState, message: UiMsg) {
                 state.push_line(format!("! {error}"));
             }
         }
+        UiMsg::CompactDone(result) => {
+            state.busy = false;
+            match result {
+                Ok(summary) => state.push_line(format!("✓ compacted: {summary}")),
+                Err(error) => state.push_line(format!("! compact failed: {error}")),
+            }
+        }
         UiMsg::ShellDone(result) => {
             state.busy = false;
             match result {
@@ -500,17 +577,6 @@ fn truncate(text: &str, limit: usize) -> String {
     let mut shortened: String = text.chars().take(limit).collect();
     shortened.push('…');
     shortened
-}
-
-fn session_root() -> PathBuf {
-    std::env::var_os("RSH_HOME").map_or_else(
-        || {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".rsh")
-        },
-        PathBuf::from,
-    )
 }
 
 #[cfg(test)]

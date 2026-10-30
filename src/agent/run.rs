@@ -7,9 +7,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::llm::{ChatRequest, LlmClient, LlmEvent, Message};
+use crate::llm::{ChatRequest, LlmClient, LlmEvent, Message, Role};
 use crate::session::{EventKind, SessionStore};
 use crate::skills::SkillRegistry;
+use crate::subagent::SubagentRunner;
 use crate::tools::{ToolCtx, ToolOutput, ToolRegistry, UserIo};
 
 const SYSTEM_PROMPT: &str = "\
@@ -38,6 +39,7 @@ pub enum AgentEvent {
 pub struct TurnOutcome {
     pub text: String,
     pub steps: usize,
+    pub changed_files: Vec<PathBuf>,
 }
 
 pub struct Agent {
@@ -49,6 +51,7 @@ pub struct Agent {
     session: Option<SessionStore>,
     skills: Option<Arc<SkillRegistry>>,
     user_io: Option<Arc<dyn UserIo>>,
+    subagents: Option<Arc<dyn SubagentRunner>>,
 }
 
 impl Agent {
@@ -68,6 +71,7 @@ impl Agent {
             session: None,
             skills: None,
             user_io: None,
+            subagents: None,
         }
     }
 
@@ -90,6 +94,82 @@ impl Agent {
     }
 
     #[must_use]
+    pub fn with_subagents(mut self, subagents: Arc<dyn SubagentRunner>) -> Self {
+        self.subagents = Some(subagents);
+        self
+    }
+
+    #[must_use]
+    pub fn with_messages(mut self, messages: Vec<Message>) -> Self {
+        self.messages = messages;
+        self
+    }
+
+    /// Replace older messages with a model-written summary, keeping the last
+    /// two user turns. The system prompt is preserved.
+    pub async fn compact(&mut self, instruction: Option<&str>) -> Result<String> {
+        if self.messages.len() < 4 {
+            bail!("nothing to compact yet");
+        }
+        let mut cut = None;
+        let mut seen = 0;
+        for (index, message) in self.messages.iter().enumerate().rev() {
+            if message.role == Role::User {
+                seen += 1;
+                if seen == 2 {
+                    cut = Some(index);
+                    break;
+                }
+            }
+        }
+        let Some(cut) = cut else {
+            bail!("nothing to compact yet");
+        };
+        if cut <= 1 {
+            bail!("nothing to compact yet");
+        }
+        let transcript = render_transcript(&self.messages[1..cut]);
+        let instruction = instruction
+            .unwrap_or("Keep goals, constraints, decisions, changed files, and unfinished work.");
+        let request = ChatRequest {
+            model: self.config.model.clone(),
+            messages: vec![
+                Message::system("You compress coding conversations. Reply with the summary only."),
+                Message::user(format!(
+                    "Compress the conversation below into a summary for continuing the work. {instruction}\n\n{transcript}"
+                )),
+            ],
+            tools: Vec::new(),
+            max_tokens: self.config.max_tokens.min(4096),
+            temperature: 0.0,
+            send_reasoning: false,
+        };
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let outcome = self
+            .llm
+            .stream_chat(request, tx, CancellationToken::new())
+            .await;
+        let _ = drain.await;
+        let outcome = outcome?;
+        let summary = outcome.text.trim().to_string();
+        if summary.is_empty() {
+            bail!("compaction returned an empty summary");
+        }
+
+        self.record(EventKind::Compaction {
+            summary: summary.clone(),
+            replaces_until: cut - 1,
+        });
+        let tail = self.messages.split_off(cut);
+        self.messages.truncate(1);
+        self.messages
+            .push(Message::system(format!("[compaction summary]\n{summary}")));
+        self.messages.extend(tail);
+        Ok(summary)
+    }
+
+    #[must_use]
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
@@ -102,8 +182,9 @@ impl Agent {
         events: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
     ) -> Result<TurnOutcome> {
-        if self.messages.is_empty() {
-            self.messages.push(Message::system(self.system_prompt()));
+        if !matches!(self.messages.first(), Some(message) if message.role == Role::System) {
+            self.messages
+                .insert(0, Message::system(self.system_prompt()));
         }
         self.messages.push(Message::user(input));
         self.record(EventKind::UserMessage {
@@ -111,6 +192,7 @@ impl Agent {
         });
 
         let mut final_text = String::new();
+        let mut changed_files: Vec<PathBuf> = Vec::new();
         for step in 0..self.config.max_steps {
             let request = ChatRequest {
                 model: self.config.model.clone(),
@@ -152,6 +234,7 @@ impl Agent {
                 return Ok(TurnOutcome {
                     text: final_text,
                     steps: step + 1,
+                    changed_files,
                 });
             }
 
@@ -180,6 +263,7 @@ impl Agent {
                         call.name
                     )),
                 };
+                changed_files.extend(output.changed_files.iter().cloned());
                 let _ = events
                     .send(AgentEvent::ToolEnd {
                         name: call.name.clone(),
@@ -211,6 +295,7 @@ impl Agent {
             output_limit: self.config.tool_output_limit,
             user_io: self.user_io.clone(),
             skills: self.skills.clone(),
+            subagents: self.subagents.clone(),
         }
     }
 
@@ -246,6 +331,42 @@ impl Agent {
             eprintln!("warning: failed to append session event: {error}");
         }
     }
+}
+
+fn render_transcript(messages: &[Message]) -> String {
+    let mut output = String::new();
+    for message in messages {
+        let role = match message.role {
+            Role::System => "System",
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            Role::Tool => "Tool",
+        };
+        output.push_str(role);
+        output.push_str(": ");
+        if !message.content.is_empty() {
+            output.push_str(&truncate_chars(&message.content, 2_000));
+        }
+        if !message.tool_calls.is_empty() {
+            let names: Vec<&str> = message
+                .tool_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect();
+            output.push_str(&format!(" [calls: {}]", names.join(", ")));
+        }
+        output.push('\n');
+    }
+    truncate_chars(&output, 60_000)
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut shortened: String = text.chars().take(limit).collect();
+    shortened.push('…');
+    shortened
 }
 
 fn spawn_forwarder(
@@ -449,6 +570,26 @@ mod tests {
             "{}",
             tool_message.content
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_replaces_old_messages_and_keeps_recent_turns() {
+        let mut agent = agent(vec![text("SUMMARY")], 5, false);
+        agent = agent.with_messages(vec![
+            Message::system("sys"),
+            Message::user("u1"),
+            Message::assistant("a1", None, Vec::new()),
+            Message::user("u2"),
+            Message::assistant("a2", None, Vec::new()),
+            Message::user("u3"),
+            Message::assistant("a3", None, Vec::new()),
+        ]);
+        let summary = agent.compact(None).await.unwrap();
+        assert_eq!(summary, "SUMMARY");
+        assert_eq!(agent.messages().len(), 6);
+        assert_eq!(agent.messages()[0].content, "sys");
+        assert!(agent.messages()[1].content.contains("SUMMARY"));
+        assert_eq!(agent.messages()[2].content, "u2");
     }
 
     #[tokio::test]

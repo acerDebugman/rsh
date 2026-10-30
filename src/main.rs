@@ -10,24 +10,35 @@ use tokio_util::sync::CancellationToken;
 use rsh::agent::{Agent, AgentEvent};
 use rsh::cli::{Cli, Command, ExecArgs};
 use rsh::config::{Config, PermissionMode};
-use rsh::llm::OpenAiClient;
-use rsh::session::SessionStore;
+use rsh::llm::{LlmClient, OpenAiClient};
+use rsh::session::{SessionStore, default_root, find_session, latest_session, replay};
+use rsh::skills::SkillRegistry;
+use rsh::subagent::Manager;
 use rsh::tools::ToolRegistry;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let workspace = std::env::current_dir().context("resolve current directory")?;
+    let root = default_root();
+    let resume = if let Some(id) = &cli.resume {
+        Some(find_session(&root, id).with_context(|| format!("session not found: {id}"))?)
+    } else if cli.continue_session {
+        latest_session(&root, &workspace)
+    } else {
+        None
+    };
+
     match cli.command {
-        Some(Command::Exec(args)) => run_exec(args).await,
+        Some(Command::Exec(args)) => run_exec(args, workspace, resume).await,
         None => {
             let config = Config::load(None)?;
-            let workspace = std::env::current_dir().context("resolve current directory")?;
-            rsh::tui::run(config, workspace).await
+            rsh::tui::run(config, workspace, resume).await
         }
     }
 }
 
-async fn run_exec(args: ExecArgs) -> Result<()> {
+async fn run_exec(args: ExecArgs, workspace: PathBuf, resume: Option<PathBuf>) -> Result<()> {
     let mut config = Config::load(None)?;
     if let Some(model) = &args.model {
         config.model = model.clone();
@@ -37,17 +48,33 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
     }
     config.validate()?;
 
-    let workspace = std::env::current_dir().context("resolve current directory")?;
-    let client = OpenAiClient::from_config(&config)?;
+    let client: Arc<dyn LlmClient> = Arc::new(OpenAiClient::from_config(&config)?);
+    let skills = Arc::new(SkillRegistry::discover(&workspace));
+    let manager = Arc::new(Manager::new(
+        Arc::clone(&client),
+        config.clone(),
+        Arc::clone(&skills),
+        workspace.clone(),
+    ));
     let tools = Arc::new(ToolRegistry::with_builtin_tools());
-    let mut agent = Agent::new(Arc::new(client), tools, config.clone(), workspace.clone());
+    let mut agent = Agent::new(client, tools, config.clone(), workspace.clone())
+        .with_skills(skills)
+        .with_subagents(manager);
 
-    match SessionStore::create(&session_root(), &workspace, &config.model) {
-        Ok(session) => {
-            eprintln!("session: {}", session.session_id());
-            agent = agent.with_session(session);
+    if let Some(path) = resume {
+        let events = SessionStore::load(&path)?;
+        agent = agent.with_messages(replay(&events));
+        let store = SessionStore::open(&path)?;
+        eprintln!("resumed session: {}", store.session_id());
+        agent = agent.with_session(store);
+    } else {
+        match SessionStore::create(&default_root(), &workspace, &config.model) {
+            Ok(session) => {
+                eprintln!("session: {}", session.session_id());
+                agent = agent.with_session(session);
+            }
+            Err(error) => eprintln!("warning: session log disabled: {error}"),
         }
-        Err(error) => eprintln!("warning: session log disabled: {error}"),
     }
 
     let (tx, mut rx) = mpsc::channel(256);
@@ -77,15 +104,4 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
     let _ = printer.await;
     outcome?;
     Ok(())
-}
-
-fn session_root() -> PathBuf {
-    std::env::var_os("RSH_HOME").map_or_else(
-        || {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".rsh")
-        },
-        PathBuf::from,
-    )
 }

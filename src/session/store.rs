@@ -79,7 +79,7 @@ impl SessionStore {
             Utc::now().format("%Y%m%dT%H%M%S%.3f"),
             std::process::id()
         );
-        let dir = root.join(slug(cwd)).join(&session_id);
+        let dir = root.join("sessions").join(slug(cwd)).join(&session_id);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create session dir {}", dir.display()))?;
         let path = dir.join("events.jsonl");
@@ -99,6 +99,24 @@ impl SessionStore {
             model: model.to_string(),
         })?;
         Ok(store)
+    }
+
+    /// Open an existing session log for appending.
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .with_context(|| format!("open session log {}", path.display()))?;
+        let session_id = path
+            .parent()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        Ok(Self {
+            path: path.to_path_buf(),
+            session_id,
+            file,
+        })
     }
 
     pub fn append(&mut self, kind: EventKind) -> Result<()> {
@@ -176,6 +194,57 @@ pub fn replay(events: &[SessionEvent]) -> Vec<Message> {
         }
     }
     messages
+}
+
+/// Find a session log by full or partial id under `root/sessions`.
+#[must_use]
+pub fn find_session(root: &Path, id: &str) -> Option<PathBuf> {
+    for slug_dir in std::fs::read_dir(root.join("sessions")).ok()?.flatten() {
+        for session_dir in std::fs::read_dir(slug_dir.path()).ok()?.flatten() {
+            let name = session_dir.file_name().to_string_lossy().to_string();
+            if !name.contains(id) {
+                continue;
+            }
+            let path = session_dir.path().join("events.jsonl");
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// Newest session log for `cwd` under `root`.
+#[must_use]
+pub fn latest_session(root: &Path, cwd: &Path) -> Option<PathBuf> {
+    let dir = root.join("sessions").join(slug(cwd));
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path().join("events.jsonl");
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(time, _)| modified > *time) {
+            best = Some((modified, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// Default data root (`RSH_HOME` or `~/.rsh`).
+#[must_use]
+pub fn default_root() -> PathBuf {
+    std::env::var_os("RSH_HOME").map_or_else(
+        || {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".rsh")
+        },
+        PathBuf::from,
+    )
 }
 
 #[must_use]
@@ -296,6 +365,22 @@ mod tests {
         let events = SessionStore::load(&path).unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0].kind, EventKind::UserMessage { text } if text == "hi"));
+    }
+
+    #[test]
+    fn finds_sessions_by_id_and_latest() {
+        let root = root();
+        let cwd = root.join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let first = SessionStore::create(&root, &cwd, "m1").unwrap();
+        let first_path = first.path().to_path_buf();
+        let first_id = first.session_id().to_string();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = SessionStore::create(&root, &cwd, "m2").unwrap();
+        let second_path = second.path().to_path_buf();
+
+        assert_eq!(find_session(&root, &first_id), Some(first_path));
+        assert_eq!(latest_session(&root, &cwd), Some(second_path));
     }
 
     #[test]

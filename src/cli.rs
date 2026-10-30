@@ -7,6 +7,14 @@ use clap::{Args, Parser, Subcommand};
     about = "A terminal coding agent with a hand-written tool loop"
 )]
 pub struct Cli {
+    /// Resume a saved session by id
+    #[arg(long, global = true)]
+    pub resume: Option<String>,
+
+    /// Resume the newest session in the current workspace
+    #[arg(long = "continue", global = true)]
+    pub continue_session: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

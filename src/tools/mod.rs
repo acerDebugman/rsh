@@ -3,7 +3,7 @@ pub mod bash;
 pub mod files;
 pub mod search;
 pub mod skill;
-pub mod unavailable;
+pub mod subagent;
 
 pub use bash::BashTool;
 
@@ -18,6 +18,7 @@ use crate::config::PermissionMode;
 use crate::error::ToolError;
 pub use crate::error::ToolResult;
 use crate::skills::SkillRegistry;
+use crate::subagent::SubagentRunner;
 
 pub const DEFAULT_OUTPUT_LIMIT: usize = 30_000;
 
@@ -28,6 +29,7 @@ pub struct ToolCtx {
     pub output_limit: usize,
     pub user_io: Option<Arc<dyn UserIo>>,
     pub skills: Option<Arc<SkillRegistry>>,
+    pub subagents: Option<Arc<dyn SubagentRunner>>,
 }
 
 impl ToolCtx {
@@ -40,6 +42,7 @@ impl ToolCtx {
             output_limit: DEFAULT_OUTPUT_LIMIT,
             user_io: None,
             skills: None,
+            subagents: None,
         }
     }
 
@@ -58,6 +61,12 @@ impl ToolCtx {
     #[must_use]
     pub fn with_skills(mut self, skills: Option<Arc<SkillRegistry>>) -> Self {
         self.skills = skills;
+        self
+    }
+
+    #[must_use]
+    pub fn with_subagents(mut self, subagents: Option<Arc<dyn SubagentRunner>>) -> Self {
+        self.subagents = subagents;
         self
     }
 }
@@ -139,6 +148,17 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     #[must_use]
     pub fn with_builtin_tools() -> Self {
+        Self::builtin(true)
+    }
+
+    /// Tools available inside a native subagent: everything except `subagent`
+    /// (no recursion).
+    #[must_use]
+    pub fn native_subagent_tools() -> Self {
+        Self::builtin(false)
+    }
+
+    fn builtin(include_subagent: bool) -> Self {
         let mut registry = Self::default();
         registry
             .register(bash::BashTool)
@@ -148,8 +168,10 @@ impl ToolRegistry {
             .register(search::GlobTool)
             .register(search::GrepTool)
             .register(ask_user::AskUserTool)
-            .register(skill::SkillTool)
-            .register(unavailable::UnavailableTool::subagent());
+            .register(skill::SkillTool);
+        if include_subagent {
+            registry.register(subagent::SubagentTool);
+        }
         registry
     }
 
