@@ -11,13 +11,16 @@ async-trait = "0.1"
 bytes = "1"
 dirs = "6"
 futures-util = "0.3"
+globset = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 toml = "0.8"
+walkdir = "2"
 
 [dev-dependencies]
 tempfile = "3"
