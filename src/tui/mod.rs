@@ -215,6 +215,13 @@ pub async fn run(config: Config, workspace: PathBuf, resume: Option<PathBuf>) ->
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     tokio::spawn(agent_actor(agent, command_rx, ui_tx.clone()));
 
+    terminal::install_panic_hook();
+    let (mut terminal, mut mode) = terminal::init()?;
+    let _guard = terminal::Guard;
+
+    // Start reading keys only after the terminal is initialized: the inline
+    // viewport's cursor-position query is answered on stdin, and a reader
+    // running earlier would steal the CPR response.
     let (key_tx, mut key_rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
         loop {
@@ -228,10 +235,6 @@ pub async fn run(config: Config, workspace: PathBuf, resume: Option<PathBuf>) ->
             }
         }
     });
-
-    terminal::install_panic_hook();
-    let (mut terminal, mut mode) = terminal::init()?;
-    let _guard = terminal::Guard;
     let mut state = UiState::new(
         config.model.clone(),
         workspace.display().to_string(),

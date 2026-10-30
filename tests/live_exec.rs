@@ -2,8 +2,15 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
-fn live_enabled() -> bool {
-    std::env::var("RSH_LIVE").ok().as_deref() == Some("1")
+/// Live tests are `#[ignore]`d: a normal `cargo test` must never report them
+/// as passing. Running them costs money and needs a real key, so they also
+/// demand `RSH_LIVE=1` as a second, deliberate confirmation.
+fn require_live() {
+    assert_eq!(
+        std::env::var("RSH_LIVE").ok().as_deref(),
+        Some("1"),
+        "set RSH_LIVE=1 to run live tests"
+    );
 }
 
 fn scratch_dir() -> tempfile::TempDir {
@@ -16,11 +23,9 @@ fn scratch_dir() -> tempfile::TempDir {
 }
 
 #[tokio::test]
+#[ignore = "live: needs a real API key and network; run with --ignored"]
 async fn exec_creates_a_file_with_content() {
-    if !live_enabled() {
-        eprintln!("skipping live test: set RSH_LIVE=1 to run it");
-        return;
-    }
+    require_live();
     let dir = scratch_dir();
     let prompt =
         "Create a file named a.txt whose content is exactly: hi. Then run `cat a.txt` to verify.";

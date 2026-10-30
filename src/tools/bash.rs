@@ -108,6 +108,66 @@ fn mutating_reason_depth(command: &str, depth: usize) -> Option<String> {
     None
 }
 
+/// Binaries that ask the OS to run the rest of the command as another user.
+const ESCALATING_BINARIES: &[&str] = &["sudo", "doas", "pkexec", "run0", "su"];
+
+/// Words that only launch another command, so the real head sits behind them.
+const TRANSPARENT_LAUNCHERS: &[&str] =
+    &["env", "command", "nohup", "time", "exec", "xargs", "nice"];
+
+/// The permission floor: privilege escalation is refused in *every* mode,
+/// including `danger-full-access`, and there is no answer that turns it on.
+///
+/// A coding task never needs root, so this is not an approval — it is a
+/// structural refusal, like the timeout and the audit log. Like
+/// [`mutating_reason`] it reads the command line rather than sandboxing the
+/// process, so an obfuscated spelling can still get through; it catches the
+/// ones a model actually emits.
+#[must_use]
+pub fn escalation_reason(command: &str) -> Option<String> {
+    escalation_reason_depth(command, 0)
+}
+
+fn escalation_reason_depth(command: &str, depth: usize) -> Option<String> {
+    if depth > 3 {
+        return None;
+    }
+    let words = tokenize(command);
+    for segment in words.split(|word| word == ";" || word == "&&" || word == "||" || word == "|") {
+        // Walk the leading run of assignments, launchers and their flags:
+        // `FOO=1 sudo -n rm x` escalates, while `echo sudo` never gets here.
+        let mut index = 0;
+        while let Some(word) = segment.get(index) {
+            if ESCALATING_BINARIES.contains(&word.as_str()) {
+                return Some(format!("runs {word}"));
+            }
+            let transparent = TRANSPARENT_LAUNCHERS.contains(&word.as_str());
+            let assignment = word.contains('=') && !word.starts_with('-');
+            if !transparent && !assignment && !word.starts_with('-') {
+                break;
+            }
+            index += 1;
+        }
+        let Some(head) = segment.get(index) else {
+            continue;
+        };
+        // A nested shell re-enters the same scan: `sh -c 'sudo rm x'`.
+        if matches!(head.as_str(), "sh" | "bash" | "zsh" | "dash") {
+            let rest = &segment[index + 1..];
+            for (position, word) in rest.iter().enumerate() {
+                if word.starts_with('-') && word.contains('c') {
+                    if let Some(inner) = rest.get(position + 1) {
+                        if let Some(reason) = escalation_reason_depth(inner, depth + 1) {
+                            return Some(format!("{head} -c: {reason}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn segment_reason(segment: &[String], depth: usize) -> Option<String> {
     // Skip env assignments and transparent launchers: `FOO=1 sudo -n rm x`.
     let mut index = 0;
@@ -272,6 +332,14 @@ impl Tool for BashTool {
             .unwrap_or(120_000)
             .clamp(1_000, 600_000);
 
+        // The permission floor comes first: no mode, and no approval, runs a
+        // command that asks the OS to act as another user.
+        if let Some(reason) = escalation_reason(command) {
+            return Ok(ToolOutput::error(format!(
+                "refused: {reason}. Privilege escalation is a permission floor, \
+                 not an approval: no mode allows it. Run the command as yourself."
+            )));
+        }
         // `--read-only` refuses anything that looks like a write; a false
         // positive costs a retry, a false negative costs the worktree.
         if let Some(reason) = mutating_reason(command) {
@@ -542,6 +610,64 @@ mod tests {
         let seen = approver.seen.lock().unwrap().clone();
         assert_eq!(seen, vec!["printf a".to_string(), "printf b".to_string()]);
         assert_eq!(ctx.approvals.len(), 2);
+    }
+
+    #[test]
+    fn escalation_is_recognised_through_launchers_and_nested_shells() {
+        for command in [
+            "sudo rm -rf /tmp/x",
+            "FOO=1 sudo -n rm x",
+            "doas touch /etc/x",
+            "pkexec sh -c 'id'",
+            "env -i sudo id",
+            "command sudo id",
+            "ls && sudo id",
+            "sh -c 'sudo id'",
+            "bash -lc 'doas id'",
+        ] {
+            assert!(
+                escalation_reason(command).is_some(),
+                "should be refused in every mode: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_that_merely_mention_escalation_are_left_alone() {
+        for command in [
+            "ls -la",
+            "grep -rn 'sudo' src/",
+            "echo sudo",
+            "man sudo",
+            "git log --grep=sudo",
+            "cat docs/sudo.md",
+        ] {
+            assert_eq!(
+                escalation_reason(command),
+                None,
+                "should be allowed: {command}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn full_access_still_refuses_escalation() {
+        let workspace = workspace();
+        let ctx = ToolCtx::new(workspace.clone());
+        assert_eq!(ctx.permission, PermissionMode::DangerFullAccess);
+        let output = BashTool
+            .run(json!({"command": "sudo id"}), &ctx)
+            .await
+            .unwrap();
+        assert!(output.is_error, "{}", output.content);
+        assert!(
+            output
+                .content
+                .to_lowercase()
+                .contains("privilege escalation is a permission floor"),
+            "{}",
+            output.content
+        );
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -32,6 +33,38 @@ fn has_sections(path: &Path) -> bool {
             .iter()
             .all(|section| text.contains(section))
     })
+}
+
+/// The status line says `Enter send` when idle and `working…` while a turn
+/// runs. Wait until the newest status marker is the idle one.
+async fn wait_idle(output: &Arc<Mutex<Vec<u8>>>, mark: usize, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        {
+            let buffer = output.lock().unwrap();
+            let slice = if mark < buffer.len() {
+                &buffer[mark..]
+            } else {
+                &[][..]
+            };
+            let tail = String::from_utf8_lossy(slice);
+            let busy = tail.rfind("working");
+            let idle_marker = tail
+                .rfind("Ctrl+J")
+                .into_iter()
+                .chain(tail.rfind("answer the question"))
+                .max();
+            match (idle_marker, busy) {
+                (Some(idle), Some(busy)) if idle > busy => return true,
+                (Some(_), None) => return true,
+                _ => {}
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 #[tokio::test]
@@ -68,6 +101,8 @@ async fn grill_me_interview_writes_the_result_file() {
 
     let mut reader = pair.master.try_clone_reader().expect("pty reader");
     let mut writer = pair.master.take_writer().expect("pty writer");
+    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let reader_output = Arc::clone(&output);
     let log_path = dir.join("pty.log");
     std::thread::spawn(move || {
         let mut log = std::fs::File::create(log_path).unwrap();
@@ -78,41 +113,43 @@ async fn grill_me_interview_writes_the_result_file() {
             }
             let _ = log.write_all(&buffer[..read]);
             let _ = log.flush();
+            let mut captured = reader_output.lock().unwrap();
+            captured.extend_from_slice(&buffer[..read]);
+            if captured.len() > 300_000 {
+                let drain = captured.len() - 200_000;
+                captured.drain(..drain);
+            }
         }
     });
 
     tokio::time::sleep(Duration::from_secs(3)).await;
+    let mark = output.lock().unwrap().len();
     send(
         &mut writer,
-        "/skill grill-me 我要用 Rust 写一个终端 coding agent：自研 loop、9 个工具、skills、native/dsh 子代理、默认全开权限。请就范围、权限、测试三点各追问我一次，然后收敛。",
+        "/skill grill-me 不要读取任何文件或仓库，只基于下面的描述提问。我要用 Rust 写一个终端 coding agent：自研 loop、9 个工具、skills、native/dsh 子代理、默认全开权限。请就范围、权限、测试各追问我一次，然后收敛。",
+    );
+    assert!(
+        wait_idle(&output, mark, Duration::from_secs(180)).await,
+        "initial turn did not finish"
     );
 
-    // The agent may end each round with questions (idle) or call ask_user
-    // (blocking). Sending an answer and flushing with Enter covers both.
     let mut result = None;
-    for _ in 0..4 {
-        tokio::time::sleep(Duration::from_secs(25)).await;
+    let mark = output.lock().unwrap().len();
+    send(
+        &mut writer,
+        "都按你的建议，直接收敛。请把最终结论写到 grill-me-result.md，包含目标、约束、决策、风险、下一步五节。",
+    );
+    assert!(
+        wait_idle(&output, mark, Duration::from_secs(240)).await,
+        "convergence turn did not finish"
+    );
+    for _ in 0..60 {
         if let Some(path) = find_result() {
             result = Some(path);
             break;
         }
-        send(&mut writer, "都按你的建议，继续");
-    }
-
-    if result.is_none() {
-        send(
-            &mut writer,
-            "请把最终结论写到 grill-me-result.md，包含目标、约束、决策、风险、下一步五节。不要写到其他目录。",
-        );
-        for _ in 0..30 {
-            if let Some(path) = find_result() {
-                result = Some(path);
-                break;
-            }
-            // Flush anything that was typed while a turn was still running.
-            press_enter(&mut writer);
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
+        press_enter(&mut writer);
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 
     let _ = child.kill();
