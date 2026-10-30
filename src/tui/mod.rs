@@ -6,15 +6,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentEvent, TurnOutcome};
 use crate::config::Config;
+use crate::error::ToolError;
 use crate::llm::OpenAiClient;
 use crate::session::SessionStore;
-use crate::tools::{BashTool, Tool, ToolCtx, ToolOutput, ToolRegistry};
+use crate::skills::SkillRegistry;
+use crate::tools::{BashTool, Tool, ToolCtx, ToolOutput, ToolRegistry, UserIo};
 
 pub(crate) struct UiState {
     pub(crate) input: String,
@@ -25,11 +28,17 @@ pub(crate) struct UiState {
     pub(crate) quit: bool,
     pub(crate) model: String,
     pub(crate) cwd: String,
+    pub(crate) question: Option<PendingQuestion>,
+    skills: Arc<SkillRegistry>,
     current_cancel: Option<CancellationToken>,
 }
 
+pub(crate) struct PendingQuestion {
+    reply: oneshot::Sender<String>,
+}
+
 impl UiState {
-    fn new(model: String, cwd: String) -> Self {
+    fn new(model: String, cwd: String, skills: Arc<SkillRegistry>) -> Self {
         Self {
             input: String::new(),
             busy: false,
@@ -39,6 +48,8 @@ impl UiState {
             quit: false,
             model,
             cwd,
+            question: None,
+            skills,
             current_cancel: None,
         }
     }
@@ -60,24 +71,57 @@ enum UiMsg {
     Agent(AgentEvent),
     TurnDone(Result<TurnOutcome, String>),
     ShellDone(Result<ToolOutput, String>),
+    Question {
+        question: String,
+        options: Vec<String>,
+        reply: oneshot::Sender<String>,
+    },
+}
+
+struct TuiUserIo {
+    ui_tx: mpsc::UnboundedSender<UiMsg>,
+}
+
+#[async_trait]
+impl UserIo for TuiUserIo {
+    async fn ask(&self, question: &str, options: &[String]) -> Result<String, ToolError> {
+        let (reply, response) = oneshot::channel();
+        self.ui_tx
+            .send(UiMsg::Question {
+                question: question.to_string(),
+                options: options.to_vec(),
+                reply,
+            })
+            .map_err(|_| ToolError::Other("UI is closed".into()))?;
+        response
+            .await
+            .map_err(|_| ToolError::Other("question was cancelled".into()))
+    }
 }
 
 pub async fn run(config: Config, workspace: PathBuf) -> Result<()> {
     let client = OpenAiClient::from_config(&config)?;
     let tools = Arc::new(ToolRegistry::with_builtin_tools());
+    let skills = Arc::new(SkillRegistry::discover(&workspace));
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+    let user_io = Arc::new(TuiUserIo {
+        ui_tx: ui_tx.clone(),
+    });
+
     let mut agent = Agent::new(
         Arc::new(client),
         Arc::clone(&tools),
         config.clone(),
         workspace.clone(),
-    );
+    )
+    .with_skills(Arc::clone(&skills))
+    .with_user_io(user_io);
     match SessionStore::create(&session_root(), &workspace, &config.model) {
         Ok(session) => agent = agent.with_session(session),
         Err(error) => eprintln!("warning: session log disabled: {error}"),
     }
 
     let (command_tx, command_rx) = mpsc::unbounded_channel();
-    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
     tokio::spawn(agent_actor(agent, command_rx, ui_tx.clone()));
 
     let (key_tx, mut key_rx) = mpsc::unbounded_channel();
@@ -97,7 +141,11 @@ pub async fn run(config: Config, workspace: PathBuf) -> Result<()> {
     terminal::install_panic_hook();
     let (mut terminal, mut mode) = terminal::init()?;
     let _guard = terminal::Guard;
-    let mut state = UiState::new(config.model.clone(), workspace.display().to_string());
+    let mut state = UiState::new(
+        config.model.clone(),
+        workspace.display().to_string(),
+        Arc::clone(&skills),
+    );
 
     loop {
         if let Err(error) = terminal.draw(|frame| render::draw(frame, &state, mode)) {
@@ -171,7 +219,7 @@ fn handle_terminal_event(
             handle_key(state, key, command_tx, ui_tx, workspace);
         }
         Event::Paste(text) => {
-            if !state.busy {
+            if !state.busy || state.question.is_some() {
                 state
                     .input
                     .push_str(&text.replace("\r\n", "\n").replace('\r', ""));
@@ -190,7 +238,9 @@ fn handle_key(
 ) {
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if state.busy {
+            if state.question.is_some() {
+                cancel_question(state);
+            } else if state.busy {
                 cancel_turn(state);
             } else if state.input.is_empty() {
                 state.quit = true;
@@ -208,11 +258,17 @@ fn handle_key(
         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.input.push('\n');
         }
-        KeyCode::Enter if !state.busy => {
-            submit(state, command_tx, ui_tx, workspace);
+        KeyCode::Enter => {
+            if state.question.is_some() {
+                answer_question(state);
+            } else if !state.busy {
+                submit(state, command_tx, ui_tx, workspace);
+            }
         }
         KeyCode::Esc => {
-            if state.busy {
+            if state.question.is_some() {
+                cancel_question(state);
+            } else if state.busy {
                 cancel_turn(state);
             } else {
                 state.input.clear();
@@ -244,6 +300,29 @@ fn submit(
         return;
     }
     if let Some(command) = trimmed.strip_prefix('/') {
+        if let Some(args) = command.strip_prefix("skill") {
+            let args = args.trim_start();
+            if args.is_empty() {
+                state.push_line("usage: /skill <name> [task]");
+                return;
+            }
+            let mut parts = args.splitn(2, char::is_whitespace);
+            let name = parts.next().unwrap_or("");
+            let task = parts.next().unwrap_or("").trim();
+            match state.skills.get(name) {
+                Some(skill) => {
+                    let mut payload = skill.render();
+                    if !task.is_empty() {
+                        payload.push_str("\n\nUser task: ");
+                        payload.push_str(task);
+                    }
+                    state.push_line(format!("› /skill {name}"));
+                    start_turn(state, payload, command_tx, ui_tx);
+                }
+                None => state.push_line(format!("unknown skill: {name}")),
+            }
+            return;
+        }
         handle_slash(state, command);
         return;
     }
@@ -253,6 +332,15 @@ fn submit(
     }
 
     state.push_line(format!("› {input}"));
+    start_turn(state, input, command_tx, ui_tx);
+}
+
+fn start_turn(
+    state: &mut UiState,
+    input: String,
+    command_tx: &mpsc::UnboundedSender<Command>,
+    ui_tx: &mpsc::UnboundedSender<UiMsg>,
+) {
     state.busy = true;
     let cancel = CancellationToken::new();
     state.current_cancel = Some(cancel.clone());
@@ -270,6 +358,20 @@ fn submit(
         };
         let _ = ui.send(UiMsg::TurnDone(result));
     });
+}
+
+fn answer_question(state: &mut UiState) {
+    let answer = std::mem::take(&mut state.input);
+    if let Some(question) = state.question.take() {
+        state.push_line(format!("↳ {answer}"));
+        let _ = question.reply.send(answer);
+    }
+}
+
+fn cancel_question(state: &mut UiState) {
+    if let Some(question) = state.question.take() {
+        let _ = question.reply.send(String::new());
+    }
 }
 
 fn handle_slash(state: &mut UiState, command: &str) {
@@ -340,10 +442,22 @@ fn handle_ui_message(state: &mut UiState, message: UiMsg) {
         UiMsg::Agent(AgentEvent::ToolEnd { name, ok, .. }) => {
             state.push_line(format!("{} {name}", if ok { "✓" } else { "✗" }));
         }
+        UiMsg::Question {
+            question,
+            options,
+            reply,
+        } => {
+            state.push_line(format!("? {question}"));
+            for (index, option) in options.iter().enumerate() {
+                state.push_line(format!("  {}. {option}", index + 1));
+            }
+            state.question = Some(PendingQuestion { reply });
+        }
         UiMsg::TurnDone(result) => {
             flush_stream(state);
             state.busy = false;
             state.current_cancel = None;
+            state.question = None;
             if let Err(error) = result {
                 state.push_line(format!("! {error}"));
             }
@@ -411,14 +525,14 @@ mod tests {
 
     #[test]
     fn slash_quit_sets_flag() {
-        let mut state = UiState::new("m".into(), "cwd".into());
+        let mut state = UiState::new("m".into(), "cwd".into(), Arc::new(SkillRegistry::default()));
         handle_slash(&mut state, "quit");
         assert!(state.quit);
     }
 
     #[test]
     fn complete_lines_are_split_from_partial() {
-        let mut state = UiState::new("m".into(), "cwd".into());
+        let mut state = UiState::new("m".into(), "cwd".into(), Arc::new(SkillRegistry::default()));
         state.stream_buf.push_str("one\ntwo");
         drain_complete_lines(&mut state);
         assert_eq!(state.pending, vec!["one"]);

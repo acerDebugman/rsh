@@ -17,47 +17,6 @@ pub struct UnavailableTool {
 
 impl UnavailableTool {
     #[must_use]
-    pub fn ask_user() -> Self {
-        Self {
-            name: "ask_user",
-            description: "Ask the user a question and wait for an answer.",
-            schema: function_schema(
-                "ask_user",
-                "Ask the user a question and wait for an answer.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "question": {"type": "string"},
-                        "options": {"type": "array", "items": {"type": "string"}}
-                    },
-                    "required": ["question"],
-                    "additionalProperties": false
-                }),
-            ),
-            reason: "the interactive question sheet lands in M3",
-        }
-    }
-
-    #[must_use]
-    pub fn skill() -> Self {
-        Self {
-            name: "skill",
-            description: "Load a skill by name and follow its instructions.",
-            schema: function_schema(
-                "skill",
-                "Load a skill by name and follow its instructions.",
-                json!({
-                    "type": "object",
-                    "properties": {"name": {"type": "string"}},
-                    "required": ["name"],
-                    "additionalProperties": false
-                }),
-            ),
-            reason: "the skill loader lands in M3",
-        }
-    }
-
-    #[must_use]
     pub fn subagent() -> Self {
         Self {
             name: "subagent",
@@ -111,11 +70,7 @@ mod tests {
     #[tokio::test]
     async fn stubs_keep_the_final_tool_surface() {
         let ctx = ToolCtx::new(std::env::temp_dir());
-        for tool in [
-            UnavailableTool::ask_user(),
-            UnavailableTool::skill(),
-            UnavailableTool::subagent(),
-        ] {
+        for tool in [UnavailableTool::subagent()] {
             let output = tool.run(serde_json::json!({}), &ctx).await.unwrap();
             assert!(output.is_error);
             assert!(output.content.contains("not available in M1"));
@@ -145,13 +100,5 @@ mod tests {
 
     fn tool_count(registry: &super::super::ToolRegistry) -> usize {
         registry.names().len()
-    }
-
-    #[test]
-    fn stub_schema_is_a_function_definition() {
-        let tool = UnavailableTool::skill();
-        let schema = tool.schema();
-        assert_eq!(schema["type"], "function");
-        assert_eq!(schema["function"]["name"], "skill");
     }
 }

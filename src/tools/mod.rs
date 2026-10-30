@@ -1,11 +1,14 @@
+pub mod ask_user;
 pub mod bash;
 pub mod files;
 pub mod search;
+pub mod skill;
 pub mod unavailable;
 
 pub use bash::BashTool;
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -14,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::PermissionMode;
 use crate::error::ToolError;
 pub use crate::error::ToolResult;
+use crate::skills::SkillRegistry;
 
 pub const DEFAULT_OUTPUT_LIMIT: usize = 30_000;
 
@@ -22,6 +26,8 @@ pub struct ToolCtx {
     pub permission: PermissionMode,
     pub cancel: CancellationToken,
     pub output_limit: usize,
+    pub user_io: Option<Arc<dyn UserIo>>,
+    pub skills: Option<Arc<SkillRegistry>>,
 }
 
 impl ToolCtx {
@@ -32,6 +38,8 @@ impl ToolCtx {
             permission: PermissionMode::DangerFullAccess,
             cancel: CancellationToken::new(),
             output_limit: DEFAULT_OUTPUT_LIMIT,
+            user_io: None,
+            skills: None,
         }
     }
 
@@ -40,6 +48,25 @@ impl ToolCtx {
         self.permission = permission;
         self
     }
+
+    #[must_use]
+    pub fn with_user_io(mut self, user_io: Option<Arc<dyn UserIo>>) -> Self {
+        self.user_io = user_io;
+        self
+    }
+
+    #[must_use]
+    pub fn with_skills(mut self, skills: Option<Arc<SkillRegistry>>) -> Self {
+        self.skills = skills;
+        self
+    }
+}
+
+/// Bridge from `ask_user` to an interactive surface. The TUI implements this;
+/// headless runs leave it unset and the tool reports that no UI is available.
+#[async_trait]
+pub trait UserIo: Send + Sync {
+    async fn ask(&self, question: &str, options: &[String]) -> ToolResult<String>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -120,8 +147,8 @@ impl ToolRegistry {
             .register(files::EditFileTool)
             .register(search::GlobTool)
             .register(search::GrepTool)
-            .register(unavailable::UnavailableTool::ask_user())
-            .register(unavailable::UnavailableTool::skill())
+            .register(ask_user::AskUserTool)
+            .register(skill::SkillTool)
             .register(unavailable::UnavailableTool::subagent());
         registry
     }

@@ -9,7 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::llm::{ChatRequest, LlmClient, LlmEvent, Message};
 use crate::session::{EventKind, SessionStore};
-use crate::tools::{ToolCtx, ToolOutput, ToolRegistry};
+use crate::skills::SkillRegistry;
+use crate::tools::{ToolCtx, ToolOutput, ToolRegistry, UserIo};
 
 const SYSTEM_PROMPT: &str = "\
 You are rsh, a terminal coding agent working inside the user's workspace.\n\
@@ -46,6 +47,8 @@ pub struct Agent {
     workspace: PathBuf,
     messages: Vec<Message>,
     session: Option<SessionStore>,
+    skills: Option<Arc<SkillRegistry>>,
+    user_io: Option<Arc<dyn UserIo>>,
 }
 
 impl Agent {
@@ -63,12 +66,26 @@ impl Agent {
             workspace,
             messages: Vec::new(),
             session: None,
+            skills: None,
+            user_io: None,
         }
     }
 
     #[must_use]
     pub fn with_session(mut self, session: SessionStore) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    #[must_use]
+    pub fn with_skills(mut self, skills: Arc<SkillRegistry>) -> Self {
+        self.skills = Some(skills);
+        self
+    }
+
+    #[must_use]
+    pub fn with_user_io(mut self, user_io: Arc<dyn UserIo>) -> Self {
+        self.user_io = Some(user_io);
         self
     }
 
@@ -86,7 +103,7 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<TurnOutcome> {
         if self.messages.is_empty() {
-            self.messages.push(Message::system(SYSTEM_PROMPT));
+            self.messages.push(Message::system(self.system_prompt()));
         }
         self.messages.push(Message::user(input));
         self.record(EventKind::UserMessage {
@@ -192,7 +209,33 @@ impl Agent {
             permission: self.config.permissions.mode,
             cancel: cancel.clone(),
             output_limit: self.config.tool_output_limit,
+            user_io: self.user_io.clone(),
+            skills: self.skills.clone(),
         }
+    }
+
+    fn system_prompt(&self) -> String {
+        let mut prompt = SYSTEM_PROMPT.to_string();
+        let Some(skills) = &self.skills else {
+            return prompt;
+        };
+        let visible: Vec<_> = skills
+            .list()
+            .into_iter()
+            .filter(|skill| !skill.disable_model_invocation)
+            .collect();
+        if visible.is_empty() {
+            return prompt;
+        }
+        prompt.push_str("\n\nAvailable skills (load with the skill tool):\n");
+        for skill in visible {
+            if skill.description.is_empty() {
+                prompt.push_str(&format!("- {}\n", skill.name));
+            } else {
+                prompt.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+            }
+        }
+        prompt
     }
 
     fn record(&mut self, kind: EventKind) {

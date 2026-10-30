@@ -80,7 +80,9 @@ fn draw_composer(frame: &mut Frame, state: &UiState, area: Rect) {
         area.y + input_height - 1,
     ));
 
-    let status = if state.busy {
+    let status = if state.question.is_some() {
+        format!("{} · answer the question · Enter send", state.model)
+    } else if state.busy {
         format!("{} · working…  Esc cancel", state.model)
     } else {
         format!(
