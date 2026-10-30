@@ -39,5 +39,9 @@ export NO_PROXY="127.0.0.1,localhost"
 # Keep cargo's home inside the workspace when the session is sandboxed
 # (writes to ~/.cargo are denied); remove this line for a normal shell.
 export CARGO_HOME="${RSH_CARGO_HOME:-$ROOT/.tmp/cargo-home}"
+# The sandbox makes /home/algo/bigtmp (the machine TMPDIR) read-only; keep
+# rustc/rustdoc scratch files inside the workspace.
+export TMPDIR="${RSH_TMPDIR:-$ROOT/target/tmp}"
+mkdir -p "$TMPDIR"
 
-echo "dev-env: CARGO_HTTP_PROXY=${CARGO_HTTP_PROXY} CARGO_HOME=${CARGO_HOME}"
+echo "dev-env: CARGO_HTTP_PROXY=${CARGO_HTTP_PROXY} CARGO_HOME=${CARGO_HOME} TMPDIR=${TMPDIR}"
