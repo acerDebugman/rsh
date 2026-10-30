@@ -46,7 +46,6 @@ pub struct Agent {
     workspace: PathBuf,
     messages: Vec<Message>,
     session: Option<SessionStore>,
-    cancel: CancellationToken,
 }
 
 impl Agent {
@@ -64,7 +63,6 @@ impl Agent {
             workspace,
             messages: Vec::new(),
             session: None,
-            cancel: CancellationToken::new(),
         }
     }
 
@@ -79,17 +77,13 @@ impl Agent {
         &self.messages
     }
 
-    #[must_use]
-    pub fn cancel_token(&self) -> CancellationToken {
-        self.cancel.clone()
-    }
-
     /// Run one user turn to completion. Tool failures are returned to the
     /// model as `role=tool` messages; only transport/loop errors abort.
     pub async fn run_turn(
         &mut self,
         input: &str,
         events: mpsc::Sender<AgentEvent>,
+        cancel: CancellationToken,
     ) -> Result<TurnOutcome> {
         if self.messages.is_empty() {
             self.messages.push(Message::system(SYSTEM_PROMPT));
@@ -111,7 +105,7 @@ impl Agent {
             };
             let (tx, rx) = mpsc::channel(256);
             let forwarder = spawn_forwarder(rx, events.clone());
-            let result = self.llm.stream_chat(request, tx, self.cancel.clone()).await;
+            let result = self.llm.stream_chat(request, tx, cancel.clone()).await;
             let _ = forwarder.await;
             let outcome = result?;
 
@@ -155,7 +149,7 @@ impl Agent {
                 let raw = if raw.is_empty() { "{}" } else { raw };
                 let output = match serde_json::from_str::<Value>(raw) {
                     Ok(Value::Object(map)) => {
-                        let ctx = self.tool_ctx();
+                        let ctx = self.tool_ctx(&cancel);
                         self.tools
                             .run(&call.name, Value::Object(map), &ctx)
                             .await
@@ -192,11 +186,11 @@ impl Agent {
         bail!("max steps ({}) exceeded", self.config.max_steps)
     }
 
-    fn tool_ctx(&self) -> ToolCtx {
+    fn tool_ctx(&self, cancel: &CancellationToken) -> ToolCtx {
         ToolCtx {
             workspace: self.workspace.clone(),
             permission: self.config.permissions.mode,
-            cancel: self.cancel.clone(),
+            cancel: cancel.clone(),
             output_limit: self.config.tool_output_limit,
         }
     }
@@ -344,7 +338,10 @@ mod tests {
     async fn text_only_turn_returns_text() {
         let mut agent = agent(vec![text("hello")], 5, false);
         let (tx, mut rx) = mpsc::channel(16);
-        let outcome = agent.run_turn("hi", tx).await.unwrap();
+        let outcome = agent
+            .run_turn("hi", tx, CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(outcome.text, "hello");
         assert_eq!(outcome.steps, 1);
         let mut texts = Vec::new();
@@ -360,7 +357,10 @@ mod tests {
     async fn tool_call_then_text() {
         let mut agent = agent(vec![call("call_1", "{}"), text("done")], 5, false);
         let (tx, _rx) = mpsc::channel(16);
-        let outcome = agent.run_turn("do it", tx).await.unwrap();
+        let outcome = agent
+            .run_turn("do it", tx, CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(outcome.text, "done");
         assert_eq!(outcome.steps, 2);
         let tool_message = agent
@@ -375,7 +375,10 @@ mod tests {
     async fn tool_failure_is_returned_to_the_model() {
         let mut agent = agent(vec![call("call_1", "{}"), text("recovered")], 5, true);
         let (tx, _rx) = mpsc::channel(16);
-        let outcome = agent.run_turn("do it", tx).await.unwrap();
+        let outcome = agent
+            .run_turn("do it", tx, CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(outcome.text, "recovered");
         let tool_message = agent
             .messages()
@@ -389,7 +392,10 @@ mod tests {
     async fn invalid_arguments_become_a_tool_error() {
         let mut agent = agent(vec![call("call_1", "{oops"), text("done")], 5, false);
         let (tx, _rx) = mpsc::channel(16);
-        agent.run_turn("do it", tx).await.unwrap();
+        agent
+            .run_turn("do it", tx, CancellationToken::new())
+            .await
+            .unwrap();
         let tool_message = agent
             .messages()
             .iter()
@@ -406,7 +412,10 @@ mod tests {
     async fn max_steps_is_enforced() {
         let mut agent = agent(vec![call("call_1", "{}"), call("call_2", "{}")], 2, false);
         let (tx, _rx) = mpsc::channel(16);
-        let error = agent.run_turn("loop", tx).await.unwrap_err();
+        let error = agent
+            .run_turn("loop", tx, CancellationToken::new())
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("max steps"), "{error}");
     }
 }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use rsh::agent::{Agent, AgentEvent};
 use rsh::cli::{Cli, Command, ExecArgs};
@@ -69,7 +70,9 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
         let _ = writeln!(stdout);
     });
 
-    let outcome = agent.run_turn(&args.prompt(), tx).await;
+    let outcome = agent
+        .run_turn(&args.prompt(), tx, CancellationToken::new())
+        .await;
     let _ = printer.await;
     outcome?;
     Ok(())
