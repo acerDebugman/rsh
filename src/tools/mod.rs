@@ -3,6 +3,8 @@ pub mod files;
 pub mod search;
 pub mod unavailable;
 
+pub use bash::BashTool;
+
 use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;

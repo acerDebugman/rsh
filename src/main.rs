@@ -20,8 +20,9 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Exec(args)) => run_exec(args).await,
         None => {
-            eprintln!("rsh: the interactive TUI lands in M2; use `rsh exec \"...\"` for now");
-            Ok(())
+            let config = Config::load(None)?;
+            let workspace = std::env::current_dir().context("resolve current directory")?;
+            rsh::tui::run(config, workspace).await
         }
     }
 }
