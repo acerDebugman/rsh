@@ -7,6 +7,13 @@
 
 > **实现状态（2026-10-31）**：M1–M5 已完成；`cargo test` 与两个 live e2e（Python 项目、grill-me）通过。实现期偏差：`workspace-write` 改为 `read-only`；inline viewport 拿不到 CPR 时降级为全屏；composer 暂只支持末尾编辑；新增 `src/prompt.rs`（统一系统提示词）与 `Approver`/`SessionApprovals` 审批层。
 
+**验证记录（2026-10-31）**：
+
+- `cargo test`：96 lib + 11 contracts + 11 tool_semantics + 1 pty，全部通过；live 用例默认 `#[ignore]`。
+- `RSH_LIVE=1 cargo test --test e2e_project -- --ignored`：15.7s 通过（Python todo CLI + unittest）。
+- `RSH_LIVE=1 cargo test --test e2e_grill_me`：36.5s 通过，产出 `target/e2e-grill/grill-me-result.md`（含目标/约束/决策/风险/下一步）。
+- 手工：`rsh exec` 完成项目开发；`rsh --resume <id>` 续聊；native 子代理写文件；dsh 子代理走 ACP（session 日志 `backend: dsh-acp`）。
+
 ---
 
 ## 0. 一页摘要
