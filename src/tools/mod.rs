@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::PermissionMode;
-use crate::error::{ToolError, ToolResult};
+use crate::error::ToolError;
+pub use crate::error::ToolResult;
 
 pub const DEFAULT_OUTPUT_LIMIT: usize = 30_000;
 
