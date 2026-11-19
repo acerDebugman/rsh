@@ -538,7 +538,7 @@ mode = "danger-full-access"   # ask | read-only | danger-full-access
 
 ## 14. 配置
 
-路径：`~/.config/rsh/config.toml`（`RSH_CONFIG` 可覆盖）。
+路径：`~/.rsh/config.toml`（`RSH_CONFIG` 可覆盖）。
 
 ```toml
 model = "deepseek-flash"

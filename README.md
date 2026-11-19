@@ -57,7 +57,7 @@ TUI 按键：
 
 ## 配置
 
-`~/.config/rsh/config.toml`（`RSH_CONFIG` 可覆盖）：
+`~/.rsh/config.toml`（`RSH_CONFIG` 可覆盖）：
 
 ```toml
 model = "deepseek-flash"

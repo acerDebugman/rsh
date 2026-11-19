@@ -114,7 +114,7 @@ rsh 要在**一个 Rust 二进制**里同时做到：
 - **MODEL-3** API key 读取顺序：`RSH_API_KEY` → `api_key_file`（默认 `~/.config/ds.key`）→ `DEEPSEEK_API_KEY`。
 - **MODEL-4** 捕获 `reasoning_content`；默认不回传，配置 `send_reasoning` 可切换。
 - **MODEL-5** 重试仅限网络错误/429/5xx，指数退避 3 次；4xx 不重试。
-- **MODEL-6** 配置路径 `~/.config/rsh/config.toml`，环境变量可覆盖（见计划 §14）。
+- **MODEL-6** 配置路径 `~/.rsh/config.toml`，环境变量可覆盖（见计划 §14）。
 
 ### 4.8 权限与安全（PERM）
 

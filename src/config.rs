@@ -7,8 +7,8 @@ pub const DEFAULT_MODEL: &str = "deepseek-flash";
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 pub const CONFIG_PATH_ENV: &str = "RSH_CONFIG";
 
-/// Runtime configuration, loaded from `~/.config/rsh/config.toml` and
-/// overridden by `RSH_*` environment variables.
+/// Runtime configuration, loaded from `~/.rsh/config.toml` and overridden by
+/// `RSH_*` environment variables.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -157,7 +157,7 @@ impl Config {
 
 #[must_use]
 pub fn default_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("rsh").join("config.toml"))
+    dirs::home_dir().map(|dir| dir.join(".rsh").join("config.toml"))
 }
 
 #[must_use]
@@ -210,6 +210,12 @@ mod tests {
         assert_eq!(config.base_url, "https://api.deepseek.com");
         assert_eq!(config.max_steps, 50);
         assert_eq!(config.permissions.mode, PermissionMode::DangerFullAccess);
+    }
+
+    #[test]
+    fn default_config_is_under_rsh_home() {
+        let expected = dirs::home_dir().map(|dir| dir.join(".rsh").join("config.toml"));
+        assert_eq!(default_config_path(), expected);
     }
 
     #[test]
